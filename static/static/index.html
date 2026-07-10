@@ -1,0 +1,730 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Network Companion</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Command bar -->
+  <header class="topbar">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 40 40" aria-hidden="true">
+        <circle cx="20" cy="20" r="17" class="m-ring m-ring-3" />
+        <circle cx="20" cy="20" r="11" class="m-ring m-ring-2" />
+        <circle cx="20" cy="20" r="5"  class="m-ring m-ring-1" />
+        <path d="M20 3 L20 37" class="m-sweep" />
+        <path d="M6 26 L20 20 L34 14" class="m-signal" />
+        <circle cx="20" cy="20" r="2.4" class="m-core" />
+      </svg>
+      <div class="brand-text">
+        <span class="brand-name">NETWORK COMPANION</span>
+        <span class="brand-sub">packet workbench</span>
+      </div>
+    </div>
+
+    <div class="capbar">
+      <div class="field">
+        <label>Interface</label>
+        <select id="iface"></select>
+      </div>
+      <div class="field grow">
+        <label>Capture filter <span class="hint">BPF</span> <span class="filter-state" id="bpf-state"></span></label>
+        <input id="bpf" type="text" spellcheck="false" list="bpf-suggestions"
+               placeholder="e.g. tcp port 443 or host 10.0.0.5" />
+        <datalist id="bpf-suggestions">
+          <option value="tcp"></option>
+          <option value="udp"></option>
+          <option value="icmp"></option>
+          <option value="arp"></option>
+          <option value="port 53"></option>
+          <option value="tcp port 443"></option>
+          <option value="tcp port 80"></option>
+          <option value="host 10.0.0.5"></option>
+          <option value="net 192.168.0.0/16"></option>
+          <option value="tcp[tcpflags] == 0"></option>
+          <option value="tcp[tcpflags] &amp; (tcp-syn|tcp-ack) == tcp-syn"></option>
+          <option value="tcp[tcpflags] == (tcp-fin|tcp-push|tcp-urg)"></option>
+          <option value="not arp and not port 53"></option>
+        </datalist>
+      </div>
+      <label class="toggle" title="Capture all frames on the segment, not only those addressed to this host">
+        <input type="checkbox" id="promisc" checked />
+        <span>Promiscuous</span>
+      </label>
+      <button id="capture-btn" class="btn btn-primary">
+        <span class="btn-dot"></span><span id="capture-label">Start capture</span>
+      </button>
+    </div>
+
+    <div class="status" id="status">
+      <span class="status-led"></span>
+      <span class="status-text">idle</span>
+    </div>
+  </header>
+
+  <!-- Tabs -->
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="capture">Capture</button>
+    <button class="tab" data-tab="nc" id="nc-tab-btn">NC Traffic <span class="tab-badge" id="nc-tab-badge" hidden>0</span></button>
+    <button class="tab" data-tab="craft">Crafter</button>
+    <button class="tab" data-tab="scan">Port Scan</button>
+    <button class="tab" data-tab="netscan">Network</button>
+    <button class="tab" data-tab="mitm">Intercept</button>
+    <button class="tab" data-tab="transfer">Transfer</button>
+    <button class="tab" data-tab="intel">IP Intel</button>
+    <button class="tab" data-tab="stats">Statistics</button>
+    <button class="tab" data-tab="ir">IR Report</button>
+  </nav>
+
+  <!-- Capture -->
+  <main class="panel active" id="panel-capture">
+    <div class="stats-strip">
+      <div class="stat"><span class="stat-k">Packets</span><span class="stat-v" id="s-count">0</span></div>
+      <div class="stat"><span class="stat-k">Rate</span><span class="stat-v" id="s-rate">0<em>/s</em></span></div>
+      <span class="source-tag" id="source-tag" hidden></span>
+      <button class="nc-jump" id="nc-jump" hidden title="Traffic Network Companion generated about itself, kept out of this capture">
+        NC traffic: <span id="nc-jump-count">0</span> ↗
+      </button>
+      <div class="proto-bar" id="proto-bar" aria-hidden="true"></div>
+      <div class="strip-actions">
+        <div class="filter-wrap">
+          <input id="display-filter" class="mini-input" type="text" spellcheck="false" list="display-suggestions"
+                 placeholder="Display filter: tcp, port 443, src 10.0.0.5, threat…" />
+          <datalist id="display-suggestions">
+            <option value="tcp"></option>
+            <option value="udp"></option>
+            <option value="dns"></option>
+            <option value="port 443"></option>
+            <option value="dport 53"></option>
+            <option value="src 10.0.0.5"></option>
+            <option value="host 8.8.8.8"></option>
+            <option value="flags S and not flags A"></option>
+            <option value="threat"></option>
+            <option value="threat high"></option>
+            <option value="tcp and port 80"></option>
+          </datalist>
+        </div>
+        <select id="filter-preset" title="Threat filter presets (apply to live or stopped captures and loaded PCAPs)"></select>
+        <button class="btn btn-ghost" id="flagged-btn" title="Show only packets flagged by the threat heuristics">Flagged only</button>
+        <button class="btn btn-ghost" id="resolve-btn" title="Resolve IP addresses to hostnames via reverse DNS">Resolve names</button>
+        <button class="btn btn-ghost" id="nc-hide-btn" title="Show or hide the NC Traffic tab and its counter">Hide NC Traffic</button>
+        <button class="btn btn-ghost" id="pause-btn">Pause</button>
+        <button class="btn btn-ghost" id="clear-btn">Clear</button>
+        <button class="btn btn-ghost" id="open-pcap-btn" title="Open a .pcap / .pcapng file">Open PCAP</button>
+        <input type="file" id="pcap-input" accept=".pcap,.pcapng,.cap" hidden />
+        <button class="btn btn-ghost" id="export-btn">Export .pcap</button>
+        <button class="btn btn-ghost" id="export-all-btn" title="Also include NC Traffic (Network Companion's own traffic), normally kept out of the saved capture">Export all traffic .pcap</button>
+      </div>
+    </div>
+
+    <div class="capture-body">
+      <div class="table-wrap" id="table-wrap">
+        <table class="pkt-table">
+          <colgroup>
+            <col data-col="num" /><col data-col="time" /><col data-col="src" />
+            <col data-col="dst" /><col data-col="proto" /><col data-col="len" /><col data-col="info" />
+          </colgroup>
+          <thead>
+            <tr>
+              <th class="c-num">#<span class="col-resizer" data-col="num"></span></th>
+              <th class="c-time">Time (ET)<span class="col-resizer" data-col="time"></span></th>
+              <th class="c-addr">Source<span class="col-resizer" data-col="src"></span></th>
+              <th class="c-addr">Destination<span class="col-resizer" data-col="dst"></span></th>
+              <th class="c-proto">Protocol<span class="col-resizer" data-col="proto"></span></th>
+              <th class="c-len">Length<span class="col-resizer" data-col="len"></span></th>
+              <th class="c-info">Info</th>
+            </tr>
+          </thead>
+        </table>
+        <div class="rows-scroll" id="rows-scroll">
+          <table class="pkt-table">
+            <colgroup>
+              <col data-col="num" /><col data-col="time" /><col data-col="src" />
+              <col data-col="dst" /><col data-col="proto" /><col data-col="len" /><col data-col="info" />
+            </colgroup>
+            <tbody id="pkt-body"></tbody>
+          </table>
+          <div class="table-empty" id="table-empty">
+            <div class="empty-icon">◇</div>
+            <p>No packets yet. Start a capture or open a PCAP.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="splitter" id="detail-splitter" title="Drag to resize"></div>
+
+      <aside class="detail" id="detail">
+        <div class="detail-empty" id="detail-empty">
+          <p>Select a packet to inspect its layers and bytes.</p>
+        </div>
+        <div class="detail-content" id="detail-content" hidden>
+          <div class="detail-head">
+            <span id="detail-title">Packet</span>
+            <span class="detail-len" id="detail-len"></span>
+          </div>
+
+          <div class="detail-actions" id="detail-actions"></div>
+
+          <div class="threat-panel clean" id="threat-panel"></div>
+
+          <div class="proc-line" id="proc-line"></div>
+
+          <div class="layer-tree" id="layer-tree"></div>
+          <div class="hex-head">Bytes</div>
+          <div class="hex-view" id="hex-view"></div>
+
+          <details class="rule-block" id="rule-block">
+            <summary>Generate detection rule</summary>
+            <div class="rule-out">
+              <h4>Suricata / Snort <button data-copy="rule-suricata">Copy</button></h4>
+              <pre class="rule-code" id="rule-suricata"></pre>
+              <h4>Splunk SPL <button data-copy="rule-splunk">Copy</button></h4>
+              <pre class="rule-code" id="rule-splunk"></pre>
+            </div>
+          </details>
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <!-- NC Traffic: packets Network Companion generated about itself -->
+  <main class="panel" id="panel-nc">
+    <div class="stats-strip">
+      <div class="stat"><span class="stat-k">Packets</span><span class="stat-v" id="nc-count">0</span></div>
+      <p class="nc-explainer">Traffic Network Companion itself generates (IP-intel lookups, its own UI, reverse-DNS, and its Crafter / Port Scan / Transfer tools) lands here instead of the main capture, and is never included when you export a .pcap.</p>
+      <div class="strip-actions">
+        <button class="btn btn-ghost" id="nc-clear-btn">Clear</button>
+      </div>
+    </div>
+    <div class="capture-body">
+      <div class="table-wrap">
+        <table class="pkt-table">
+          <colgroup>
+            <col data-col="num" /><col data-col="time" /><col data-col="src" />
+            <col data-col="dst" /><col data-col="proto" /><col data-col="len" /><col data-col="reason" />
+          </colgroup>
+          <thead>
+            <tr>
+              <th class="c-num">#</th>
+              <th class="c-time">Time (ET)</th>
+              <th class="c-addr">Source</th>
+              <th class="c-addr">Destination</th>
+              <th class="c-proto">Protocol</th>
+              <th class="c-len">Length</th>
+              <th class="c-info">Why it's here</th>
+            </tr>
+          </thead>
+          <tbody id="nc-body"></tbody>
+        </table>
+        <div class="table-empty" id="nc-empty">
+          <div class="empty-icon">◇</div>
+          <p>No Network Companion traffic seen yet.</p>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Crafter -->
+  <main class="panel" id="panel-craft">
+    <div class="craft-grid">
+      <div class="craft-form">
+        <div class="presets">
+          <span class="presets-label">Presets</span>
+          <button class="chip" data-preset="syn">TCP SYN</button>
+          <button class="chip" data-preset="ping">ICMP Ping</button>
+          <button class="chip" data-preset="dns">DNS Query</button>
+          <button class="chip" data-preset="udp">UDP Datagram</button>
+          <button class="chip" data-preset="clear">Reset</button>
+        </div>
+
+        <details class="craft-ref">
+          <summary>What do these fields mean?</summary>
+          <div class="ref-body">
+            <p><b>IP source / destination.</b> Where the packet claims to come from and where it goes. Leave source blank to use this machine's real address. If you set a source that isn't this machine (spoofing), the packet is sent at layer 2 automatically so the OS can't rewrite the source back to your real IP; for it to arrive, pick the interface that's on the target's network. Destination is required.</p>
+            <p><b>TTL</b> (time to live). How many router hops the packet may cross before it is dropped. Typical values are 64 (Linux/macOS) and 128 (Windows). Low values can be used for traceroute-style probing.</p>
+            <p><b>Ports.</b> Source port is usually random and picked by the OS; destination port selects the service (80 HTTP, 443 HTTPS, 22 SSH, 53 DNS, 3389 RDP).</p>
+            <p><b>TCP flags.</b> Control bits that define the packet's role. <b>SYN</b> opens a connection, <b>ACK</b> acknowledges data, <b>FIN</b> closes gracefully, <b>RST</b> aborts, <b>PSH</b> pushes data to the app immediately, <b>URG</b> marks urgent data. A normal handshake is SYN, then SYN+ACK, then ACK. Odd combinations (all off, or FIN+PSH+URG) are scan techniques.</p>
+            <p><b>Seq</b> (sequence number). The byte offset of this segment within the TCP stream. For a fresh crafted packet 0 is fine.</p>
+            <p><b>ICMP type / code.</b> The ICMP message kind. Type 8 code 0 is an echo request (ping); type 0 is the echo reply; type 3 is destination unreachable, with the code giving the reason.</p>
+            <p><b>Payload.</b> The data bytes after the headers. Text mode sends the characters as-is; Hex mode sends raw bytes you type as hex (for example <code>deadbeef</code>). A single packet is small, so to move a whole file use the Transfer tab instead.</p>
+            <p><b>Count / interval.</b> How many copies to send and the gap between them in milliseconds.</p>
+          </div>
+        </details>
+
+        <details class="layer-block" id="blk-ether">
+          <summary>Ethernet <span class="opt">optional · layer 2</span></summary>
+          <div class="grid-2">
+            <label>Source MAC<input id="eth-src" placeholder="auto" spellcheck="false" /></label>
+            <label>Dest MAC<input id="eth-dst" placeholder="ff:ff:ff:ff:ff:ff" spellcheck="false" /></label>
+          </div>
+          <p class="note">Enabling Ethernet sends at layer 2 on the chosen interface.</p>
+        </details>
+
+        <div class="layer-block open">
+          <div class="block-head">
+            <span>Network</span>
+            <div class="seg">
+              <button class="seg-btn active" data-ipver="4">IPv4</button>
+              <button class="seg-btn" data-ipver="6">IPv6</button>
+            </div>
+          </div>
+          <div class="grid-3">
+            <label>Source<input id="ip-src" placeholder="auto" spellcheck="false" /></label>
+            <label>Destination<input id="ip-dst" placeholder="required" spellcheck="false" /></label>
+            <label id="ttl-wrap">TTL<input id="ip-ttl" type="number" placeholder="64" /></label>
+          </div>
+        </div>
+
+        <div class="layer-block open">
+          <div class="block-head">
+            <span>Transport</span>
+            <div class="seg" id="transport-seg">
+              <button class="seg-btn active" data-transport="tcp">TCP</button>
+              <button class="seg-btn" data-transport="udp">UDP</button>
+              <button class="seg-btn" data-transport="icmp">ICMP</button>
+              <button class="seg-btn" data-transport="none">None</button>
+            </div>
+          </div>
+
+          <div class="transport-fields" id="tf-tcp">
+            <div class="grid-3">
+              <label>Source port<input id="tcp-sport" type="number" placeholder="random" /></label>
+              <label>Dest port<input id="tcp-dport" type="number" placeholder="80" /></label>
+              <label>Seq<input id="tcp-seq" type="number" placeholder="0" /></label>
+            </div>
+            <div class="flags">
+              <span class="flags-label">Flags</span>
+              <label class="flag"><input type="checkbox" value="S" checked />SYN</label>
+              <label class="flag"><input type="checkbox" value="A" />ACK</label>
+              <label class="flag"><input type="checkbox" value="F" />FIN</label>
+              <label class="flag"><input type="checkbox" value="R" />RST</label>
+              <label class="flag"><input type="checkbox" value="P" />PSH</label>
+              <label class="flag"><input type="checkbox" value="U" />URG</label>
+            </div>
+          </div>
+
+          <div class="transport-fields" id="tf-udp" hidden>
+            <div class="grid-2">
+              <label>Source port<input id="udp-sport" type="number" placeholder="random" /></label>
+              <label>Dest port<input id="udp-dport" type="number" placeholder="53" /></label>
+            </div>
+          </div>
+
+          <div class="transport-fields" id="tf-icmp" hidden>
+            <div class="grid-2">
+              <label>Type<input id="icmp-type" type="number" placeholder="8 (echo)" /></label>
+              <label>Code<input id="icmp-code" type="number" placeholder="0" /></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="layer-block open">
+          <div class="block-head">
+            <span>Payload</span>
+            <div class="seg" id="payload-seg">
+              <button class="seg-btn active" data-payload="text">Text</button>
+              <button class="seg-btn" data-payload="hex">Hex</button>
+            </div>
+          </div>
+          <textarea id="payload" rows="3" spellcheck="false"
+                    placeholder="Optional payload bytes"></textarea>
+        </div>
+
+        <div class="send-row">
+          <label class="small">Interface<select id="craft-iface"><option value="">auto</option></select></label>
+          <label class="small">Count<input id="send-count" type="number" value="1" min="1" max="1000" /></label>
+          <label class="small">Interval<input id="send-interval" type="number" value="0" min="0" /><span class="unit">ms</span></label>
+          <div class="spacer"></div>
+          <button class="btn btn-ghost" id="preview-btn">Preview</button>
+          <button class="btn btn-primary" id="send-btn">Send packet</button>
+        </div>
+        <p class="disclaimer">These are sent as real frames on the selected interface. Send only to hosts and networks you own or are authorised to test.</p>
+      </div>
+
+      <div class="craft-output">
+        <div class="output-head">Output</div>
+        <pre class="output-log" id="craft-log">Ready.</pre>
+      </div>
+    </div>
+  </main>
+
+  <!-- Port Scan -->
+  <main class="panel" id="panel-scan">
+    <div class="scan-bar">
+      <div class="field grow">
+        <label>Target host</label>
+        <input id="scan-host" type="text" spellcheck="false" placeholder="10.0.0.20 or host.lan" />
+      </div>
+      <div class="field">
+        <label>Ports</label>
+        <input id="scan-ports" type="text" spellcheck="false" list="scan-port-presets" value="top100" />
+        <datalist id="scan-port-presets">
+          <option value="top100"></option>
+          <option value="common"></option>
+          <option value="1-1024"></option>
+          <option value="22,80,443"></option>
+          <option value="1-65535"></option>
+        </datalist>
+      </div>
+      <div class="field">
+        <label>Type</label>
+        <select id="scan-type">
+          <option value="connect">TCP connect</option>
+          <option value="syn">SYN (half-open)</option>
+        </select>
+      </div>
+      <label class="toggle" title="Read a service banner from open ports (connect scan)">
+        <input type="checkbox" id="scan-banner" /><span>Banner</span>
+      </label>
+      <button class="btn btn-primary" id="scan-btn">Scan</button>
+    </div>
+
+    <div class="scan-summary" id="scan-summary" hidden></div>
+
+    <div class="scan-results-wrap">
+      <details class="nmap-ref" id="nmap-ref" open>
+        <summary><span>Nmap command reference</span><span class="nmap-summary-hint">pre-filled for your target · copy into a terminal running nmap</span></summary>
+        <div class="nmap-ref-body">
+          <div class="nmap-toolbar">
+            <input id="nmap-filter" type="text" spellcheck="false" placeholder="Filter commands: udp, vuln, evasion, smb, os, script…" />
+            <select id="nmap-cat"><option value="">All categories</option></select>
+            <span class="nmap-target" id="nmap-target"></span>
+          </div>
+          <div id="nmap-groups"></div>
+          <p class="disclaimer">These commands run Nmap on your own machine and are shown for convenience — Network Companion does not execute them. Some need <code>sudo</code> (raw sockets). Scan only hosts you own or are explicitly authorised to test.</p>
+        </div>
+      </details>
+
+      <div class="scan-empty" id="scan-empty">
+        <div class="empty-icon">◇</div>
+        <p>Enter a host and scan. SYN scans need admin rights; connect scans don't.</p>
+      </div>
+      <table class="scan-table" id="scan-table" hidden>
+        <thead><tr><th>Port</th><th>State</th><th>Service</th><th>Banner</th></tr></thead>
+        <tbody id="scan-body"></tbody>
+      </table>
+    </div>
+    <label class="scan-showclosed"><input type="checkbox" id="scan-show-closed" /> show closed / filtered ports</label>
+    <p class="disclaimer">Scan only hosts you own or are explicitly authorised to test.</p>
+  </main>
+
+  <!-- Network discovery -->
+  <main class="panel" id="panel-netscan">
+    <div class="scan-bar">
+      <div class="field">
+        <label>Interface</label>
+        <select id="net-iface"></select>
+      </div>
+      <div class="field grow">
+        <label>Subnet <span class="hint">CIDR</span></label>
+        <input id="net-cidr" type="text" spellcheck="false" placeholder="auto-detected, e.g. 192.168.1.0/24" />
+      </div>
+      <label class="toggle" title="Reverse-DNS each discovered host (slower)">
+        <input type="checkbox" id="net-resolve" checked /><span>Resolve names</span>
+      </label>
+      <button class="btn btn-primary" id="net-scan-btn">Scan network</button>
+    </div>
+
+    <div class="scan-summary" id="net-summary" hidden></div>
+
+    <div class="scan-results-wrap">
+      <div class="scan-empty" id="net-empty">
+        <div class="empty-icon">◇</div>
+        <p>Discover every device on your local subnet — IP, MAC, vendor, and a device-type guess. Runs an ARP sweep (needs sudo for a full scan).</p>
+      </div>
+      <table class="stats-table net-table" id="net-table" hidden>
+        <thead><tr>
+          <th>IP address</th><th>MAC address</th><th>Vendor</th><th>Device (guess)</th><th>Hostname</th><th></th>
+        </tr></thead>
+        <tbody id="net-body"></tbody>
+      </table>
+    </div>
+    <p class="disclaimer">Discovers hardware on a network you operate. This identifies device types by MAC vendor, not the people using them. Scan only networks you own or are authorised to assess.</p>
+  </main>
+
+  <!-- Intercept (transparent MITM capture + traffic shaping) -->
+  <main class="panel" id="panel-mitm">
+    <div class="mitm-scroll">
+      <div class="mitm-banner">
+        <strong>Authorised use only — this is a real on-path (MITM) attack technique.</strong>
+        It ARP-poisons the target so its traffic routes through this machine for capture and shaping, without installing
+        anything on the target (e.g. a malware-analysis VM or your own phone). It keeps the target online (transparent
+        forwarding) and heals the network when you stop.
+        <br /><br />
+        <strong>Intercepting traffic on a network or device you do not own or lack explicit authorisation to test is
+        illegal</strong> in most places (wiretapping, computer-misuse and privacy laws) and unethical. Only ever point
+        this at your own devices or an authorised engagement.
+      </div>
+
+      <section class="mitm-card">
+        <div class="mitm-card-head"><h3>Interception</h3><span class="mitm-state" id="mitm-state">idle</span></div>
+        <div class="mitm-grid">
+          <div class="field"><label>Interface</label><select id="mitm-iface"></select></div>
+          <div class="field"><label>Target IP <span class="req">*</span></label><input id="mitm-target" type="text" spellcheck="false" placeholder="10.0.0.50 (the device to capture)" /></div>
+          <div class="field"><label>Gateway IP</label><input id="mitm-gateway" type="text" spellcheck="false" placeholder="auto-detected" /></div>
+          <label class="toggle" title="Also poison the gateway so you see the target's inbound traffic too (full duplex)"><input type="checkbox" id="mitm-bidir" checked /><span>Both directions</span></label>
+        </div>
+        <div class="mitm-actions">
+          <button class="btn btn-primary" id="mitm-btn">Start interception</button>
+          <button class="btn btn-ghost" id="mitm-capture" disabled title="Jump to the Capture tab, filter to this target, and start recording">Capture this target</button>
+        </div>
+        <div class="mitm-info" id="mitm-info" hidden></div>
+      </section>
+
+      <section class="mitm-card" id="shape-card">
+        <div class="mitm-card-head"><h3>Traffic control</h3><span class="mitm-substate" id="shape-state">no shaping</span></div>
+        <p class="mitm-note">Apply latency, jitter, packet loss, or a bandwidth cap to the target's traffic, then watch the
+          effect in a live capture / PCAP. Shaping is scoped to the target only and needs an active interception.</p>
+        <div class="mitm-grid shape-grid">
+          <div class="field"><label>Bandwidth cap <span class="hint">kbit/s</span></label><input id="shape-rate" type="number" min="1" placeholder="e.g. 1000 (unset = uncapped)" /></div>
+          <div class="field"><label>Delay <span class="hint">ms</span></label><input id="shape-delay" type="number" min="0" placeholder="e.g. 150" /></div>
+          <div class="field"><label>Jitter <span class="hint">± ms</span></label><input id="shape-jitter" type="number" min="0" placeholder="e.g. 30" /></div>
+          <div class="field"><label>Packet loss <span class="hint">%</span></label><input id="shape-loss" type="number" min="0" max="100" step="0.1" placeholder="e.g. 5" /></div>
+        </div>
+        <div class="mitm-actions">
+          <button class="btn btn-primary" id="shape-apply">Apply shaping</button>
+          <button class="btn btn-ghost" id="shape-clear">Clear shaping</button>
+          <div class="shape-presets">
+            <span class="presets-label">Presets</span>
+            <button class="chip" data-shape="dsl">Slow DSL</button>
+            <button class="chip" data-shape="mobile">3G mobile</button>
+            <button class="chip" data-shape="lossy">Lossy Wi-Fi</button>
+            <button class="chip" data-shape="lag">High lag</button>
+          </div>
+        </div>
+      </section>
+
+      <p class="disclaimer">Interception and shaping change live network behaviour. Always Stop when finished — this
+        heals the ARP caches and restores IP forwarding. The server also cleans up automatically on shutdown.</p>
+    </div>
+  </main>
+
+  <!-- Transfer -->
+  <main class="panel" id="panel-transfer">
+    <div class="transfer-grid">
+      <div class="transfer-forms">
+        <section class="xfer-card">
+          <h3>Send data over TCP or TLS</h3>
+          <p class="xfer-note">Opens a real connection to a host and sends your payload, cleartext over plain TCP or encrypted over TLS, then shows any reply. Good for poking services on your network (an HTTP request, a probe, a custom protocol frame).</p>
+          <div class="grid-2">
+            <label>Host<input id="sd-host" placeholder="10.0.0.20" spellcheck="false" /></label>
+            <label>Port<input id="sd-port" type="number" placeholder="443" /></label>
+          </div>
+          <div class="grid-2">
+            <label>Protocol
+              <select id="sd-proto"><option value="tcp">Plain TCP</option><option value="tls">TLS (encrypted)</option></select>
+            </label>
+            <label class="toggle-inline"><input type="checkbox" id="sd-read" checked /> read response</label>
+          </div>
+          <div class="payload-head">
+            <span>Payload</span>
+            <div class="seg" id="sd-payload-seg">
+              <button class="seg-btn active" data-sdpayload="text">Text</button>
+              <button class="seg-btn" data-sdpayload="hex">Hex</button>
+            </div>
+          </div>
+          <textarea id="sd-payload" rows="3" spellcheck="false" placeholder="e.g. GET / HTTP/1.0&#10;Host: host.lan&#10;&#10;"></textarea>
+          <div class="grid-2">
+            <button class="btn btn-primary" id="sd-send">Send</button>
+            <button class="btn btn-ghost" id="sd-keylog" hidden>Download TLS key log</button>
+          </div>
+          <p class="xfer-note" id="sd-keylog-note" hidden>Point Wireshark at this file under Preferences &gt; Protocols &gt; TLS &gt; (Pre)-Master-Secret log filename to decrypt a capture of this connection. Each send gets a fresh handshake, so its keys are only good for that one connection.</p>
+        </section>
+
+        <section class="xfer-card">
+          <h3>Send a file over TCP</h3>
+          <p class="xfer-note">Streams a file to a listening host, netcat style. On the receiving machine, run a listener first, for example <code>nc -l -p 9000 &gt; received.bin</code> (or <code>ncat -l 9000 &gt; received.bin</code>), then send.</p>
+          <div class="grid-2">
+            <label>Destination host<input id="tcp-host" placeholder="10.0.0.20" spellcheck="false" /></label>
+            <label>Port<input id="tcp-port" type="number" placeholder="9000" /></label>
+          </div>
+          <label class="file-label">File<input id="tcp-file" type="file" /></label>
+          <button class="btn btn-primary" id="tcp-send-file">Send file</button>
+        </section>
+
+        <section class="xfer-card">
+          <h3>Upload a file over FTP</h3>
+          <p class="xfer-note">Stores a file on an FTP server you have access to.</p>
+          <div class="grid-2">
+            <label>FTP host<input id="ftp-host" placeholder="10.0.0.30" spellcheck="false" /></label>
+            <label>Port<input id="ftp-port" type="number" placeholder="21" /></label>
+          </div>
+          <div class="grid-2">
+            <label>Username<input id="ftp-user" placeholder="anonymous" spellcheck="false" /></label>
+            <label>Password<input id="ftp-pass" type="password" placeholder="" spellcheck="false" /></label>
+          </div>
+          <label>Remote filename<input id="ftp-remote" placeholder="(defaults to the file's name)" spellcheck="false" /></label>
+          <label class="file-label">File<input id="ftp-file" type="file" /></label>
+          <button class="btn btn-primary" id="ftp-send-file">Upload file</button>
+        </section>
+        <p class="disclaimer">Transfer only to hosts you own or are authorised to send to.</p>
+      </div>
+
+      <div class="craft-output">
+        <div class="output-head">Transfer log</div>
+        <pre class="output-log" id="xfer-log">Ready.</pre>
+      </div>
+    </div>
+  </main>
+
+  <!-- IP Intel -->
+  <main class="panel" id="panel-intel">
+    <div class="intel-search">
+      <input id="intel-ip" type="text" spellcheck="false"
+             placeholder="Enter an IP address to investigate" />
+      <button class="btn btn-primary" id="intel-btn">Look up</button>
+      <button class="btn btn-ghost" id="intel-settings-btn" title="AbuseIPDB API key">Key</button>
+    </div>
+    <div class="key-panel" id="key-panel" hidden>
+      <label>AbuseIPDB API key
+        <input id="abuse-key" type="password" spellcheck="false" placeholder="Paste key to enable abuse scoring" />
+      </label>
+      <button class="btn btn-ghost" id="save-key-btn">Save</button>
+      <span class="key-note">Stored only in this browser. Get a free key at abuseipdb.com.</span>
+    </div>
+
+    <div class="global-map-card">
+      <div class="global-map-head">
+        <h3>Where in the world</h3>
+        <span class="global-map-sub" id="gmap-sub">Every public IP in the current capture, geolocated and dropped on the map.</span>
+        <button class="btn btn-ghost" id="gmap-refresh">Plot capture endpoints</button>
+      </div>
+      <div id="gmap" class="global-map"></div>
+    </div>
+
+    <div class="intel-empty" id="intel-empty">
+      <p>Look up any public IP to see its location, network owner, and abuse reputation.</p>
+    </div>
+
+    <div class="intel-results" id="intel-results" hidden>
+      <div class="intel-cards">
+        <section class="card card-loc">
+          <header class="card-head"><h3>Location &amp; Network</h3><span class="flag" id="loc-flag"></span></header>
+          <div class="card-body" id="loc-body"></div>
+        </section>
+        <section class="card card-threat">
+          <header class="card-head"><h3>Abuse Reputation</h3><span class="src-tag">AbuseIPDB</span></header>
+          <div class="card-body threat-body">
+            <div class="gauge-wrap">
+              <svg class="gauge" viewBox="0 0 120 120">
+                <circle class="gauge-track" cx="60" cy="60" r="50" />
+                <circle class="gauge-fill" id="gauge-fill" cx="60" cy="60" r="50" />
+              </svg>
+              <div class="gauge-label">
+                <span class="gauge-score" id="gauge-score">–</span>
+                <span class="gauge-cap">confidence</span>
+              </div>
+            </div>
+            <div class="threat-meta" id="threat-meta"></div>
+          </div>
+        </section>
+      </div>
+      <div class="map-card">
+        <div id="map"></div>
+        <div class="map-fallback" id="map-fallback" hidden></div>
+      </div>
+    </div>
+
+    <div class="saved-ips-card">
+      <div class="global-map-head">
+        <h3>Saved IPs</h3>
+        <span class="global-map-sub">IPs you've tagged or colored from the capture table (right-click an address). Saved to <code>ip_notes.json</code>.</span>
+      </div>
+      <table class="pkt-table saved-ips-table" id="saved-ips-table" hidden>
+        <thead>
+          <tr><th>Color</th><th>IP</th><th>Tags</th><th>Description</th><th></th></tr>
+        </thead>
+        <tbody id="saved-ips-body"></tbody>
+      </table>
+      <p class="table-empty-inline" id="saved-ips-empty">No saved IPs yet.</p>
+    </div>
+  </main>
+
+  <!-- Statistics -->
+  <main class="panel" id="panel-stats">
+    <div class="stats-strip">
+      <div class="stat"><span class="stat-k">Source</span><span class="stat-v" id="st-source">—</span></div>
+      <div class="spacer"></div>
+      <label class="toggle" title="Fold Network Companion's own traffic (the NC Traffic tab) into these statistics">
+        <input type="checkbox" id="stats-include-nc" /><span>Include NC Traffic</span>
+      </label>
+      <label class="toggle" title="Recompute the statistics automatically while a capture is running">
+        <input type="checkbox" id="stats-auto" checked /><span>Auto-refresh</span>
+      </label>
+      <button class="btn btn-ghost" id="stats-print" title="Open a formatted report and print it (or save as PDF)">Print / PDF</button>
+      <button class="btn btn-ghost" id="stats-save" title="Download the statistics as a formatted HTML report">Save report</button>
+      <button class="btn btn-ghost" id="stats-csv" title="Download the endpoint + conversation tables as CSV">CSV</button>
+      <button class="btn btn-ghost" id="stats-refresh">Refresh</button>
+    </div>
+
+    <div class="stats-scroll" id="stats-scroll">
+      <div class="stats-empty" id="stats-empty">
+        <div class="empty-icon">◇</div>
+        <p>No packets yet. Start a capture or open a PCAP, then return here for a summary.</p>
+      </div>
+
+      <div class="stats-content" id="stats-content" hidden>
+        <div class="summary-grid" id="summary-grid"></div>
+
+        <section class="stats-section">
+          <div class="stats-sec-head"><h3>Protocol breakdown</h3><span class="stats-sec-sub" id="proto-sub"></span></div>
+          <div class="stats-table-wrap" id="proto-table"></div>
+        </section>
+
+        <section class="stats-section">
+          <div class="stats-sec-head"><h3>Endpoints · IP addresses</h3><span class="stats-sec-sub" id="ep-sub"></span></div>
+          <div class="stats-table-wrap" id="endpoints-table"></div>
+        </section>
+
+        <section class="stats-section">
+          <div class="stats-sec-head"><h3>Conversations</h3><span class="stats-sec-sub" id="conv-sub"></span></div>
+          <div class="stats-table-wrap" id="conv-table"></div>
+        </section>
+
+        <section class="stats-section">
+          <div class="stats-sec-head"><h3>Top destination ports</h3><span class="stats-sec-sub" id="ports-sub"></span></div>
+          <div class="stats-table-wrap" id="ports-table"></div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <!-- Incident Response Report -->
+  <main class="panel" id="panel-ir">
+    <div class="ir-toolbar">
+      <div class="ir-tool-left">
+        <span class="ir-title-tag">Incident Response Report</span>
+        <span class="ir-saved" id="ir-saved">Draft auto-saved in this browser</span>
+      </div>
+      <div class="ir-tool-right">
+        <button class="btn btn-ghost" id="ir-reset" title="Clear the form back to the blank template">Reset template</button>
+        <button class="btn btn-ghost" id="ir-load-json" title="Load a previously saved .json draft">Load</button>
+        <input type="file" id="ir-json-input" accept=".json" hidden />
+        <button class="btn btn-ghost" id="ir-save-json" title="Download the report as a .json draft you can reload later">Save draft (.json)</button>
+        <button class="btn btn-ghost" id="ir-md" title="Download as Markdown">Markdown</button>
+        <button class="btn btn-ghost" id="ir-word" title="Download as a Word (.doc) document">Word (.doc)</button>
+        <button class="btn btn-primary" id="ir-print" title="Open a formatted report and print it (or save as PDF)">Print / PDF</button>
+      </div>
+    </div>
+    <div class="ir-scroll">
+      <form id="ir-form" autocomplete="off"></form>
+    </div>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="app.js"></script>
+  <script src="stats.js"></script>
+  <script src="nmap.js"></script>
+  <script src="ir.js"></script>
+  <script src="netscan.js"></script>
+  <script src="mitm.js"></script>
+</body>
+</html>
