@@ -4,6 +4,10 @@ A packet analyzer, packet crafter, and IP threat-intel console in one sleek
 local web UI. Built for SOC analysts doing malware triage and for network admins
 who want to sniff a link quickly. Formerly prototyped as "Osprey".
 
+
+<img width="1521" height="840" alt="Photo" src="https://github.com/user-attachments/assets/b6255ccd-a8a8-442e-9339-2ad5e714027c" />
+
+
 ## What it does
 
 1. **Live capture** with a fast, protocol-coloured packet table, full layer
