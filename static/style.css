@@ -84,6 +84,77 @@ input:focus, select:focus, textarea:focus {
 }
 input::placeholder, textarea::placeholder { color: var(--text-faint); }
 
+/* On WebKitGTK (this app's Linux desktop build), <select> renders as an
+   actual native GTK combo box -- not just its dropdown list, the closed
+   box too -- completely ignoring the background/border/color set above.
+   `appearance: none` tells the browser to stop drawing that native
+   control at all and let our CSS fully take over instead; the custom
+   arrow replaces the native one that comes off with it. */
+select {
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'><path d='M1 1l5 5 5-5' fill='none' stroke='%238b97ad' stroke-width='1.5'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 10px 7px;
+  padding-right: 26px;
+}
+
+/* `background` doesn't inherit from <select> down to its <option> items,
+   so every dropdown list in the app was falling back to the browser's own
+   default (usually white) with this theme's near-white text colour still
+   applied on top -- unreadable everywhere, not just one page. */
+select option {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+/* ---------- fully custom dropdown (see enhanceSelect() in app.js) ----------
+   Used only for #iface and #filter-preset, the two selects that turned out
+   to render broken as native widgets on WebKitGTK. No native form control
+   involved anywhere in this -- a plain button + absolutely positioned list,
+   so there is nothing left for any browser engine's native widget handling
+   to get wrong. */
+.ncsel { position: relative; display: inline-block; }
+.ncsel-iface { min-width: 150px; }
+.ncsel-filterpreset { max-width: 190px; }
+.ncsel-real.ncsel-real {
+  position: absolute; opacity: 0; pointer-events: none;
+  width: 1px; height: 1px; overflow: hidden;
+}
+.ncsel-btn {
+  display: block; width: 100%; text-align: left;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 5px;
+  padding: 7px 26px 7px 9px; font-size: inherit; font-family: inherit;
+  cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'><path d='M1 1l5 5 5-5' fill='none' stroke='%238b97ad' stroke-width='1.5'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 10px 7px;
+}
+.ncsel-filterpreset .ncsel-btn { padding: 6px 26px 6px 8px; font-size: 12px; }
+.ncsel-btn:hover { border-color: var(--border-lit); }
+.ncsel-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ncsel-list {
+  position: absolute; top: calc(100% + 4px); left: 0; min-width: 100%;
+  max-height: 320px; overflow-y: auto; z-index: 200;
+  background: var(--surface-3); border: 1px solid var(--border-lit);
+  border-radius: var(--r); box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  padding: 4px;
+}
+.ncsel-group {
+  padding: 6px 10px 3px; font-size: 10px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-faint); white-space: nowrap;
+}
+.ncsel-item {
+  padding: 6px 10px; border-radius: 5px; font-size: 13px; color: var(--text);
+  cursor: pointer; white-space: nowrap;
+}
+.ncsel-item:hover { background: var(--surface-2); }
+.ncsel-item.active { color: var(--accent); font-weight: 600; }
+
 /* ---------- top command bar ---------- */
 .topbar {
   height: var(--topbar-h);
@@ -117,7 +188,8 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
 .field.grow { flex: 1 1 auto; max-width: 480px; }
 .field label { font-size: 10px; color: var(--text-dim); letter-spacing: .08em; text-transform: uppercase; }
 .field .hint { color: var(--accent-dim); font-weight: 600; }
-.field input, .field select { padding: 6px 9px; }
+.field input { padding: 6px 9px; }
+.field select { padding: 6px 26px 6px 9px; }
 #iface { min-width: 150px; }
 
 .toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim);
@@ -140,6 +212,10 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
   font-size: 13px; font-weight: 500; white-space: nowrap; transition: all .15s; }
 .btn:hover { border-color: var(--accent-dim); background: var(--surface-2); }
 .btn:active { transform: translateY(1px); }
+.btn:focus-visible, .tab:focus-visible, .chip:focus-visible, .seg-btn:focus-visible,
+.toggle input:focus-visible, .ine-swatch:focus-visible, .col-resizer:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
 .btn-primary { background: var(--accent); color: #04211f; border-color: var(--accent); font-weight: 600; }
 .btn-primary:hover { background: #4fe3dd; border-color: #4fe3dd; }
 .btn-primary.recording { background: var(--red); border-color: var(--red); color: #fff; }
@@ -338,6 +414,8 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
 .card-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border); }
 .card-head h3 { margin: 0; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: var(--text-dim); }
 .card-head .flag { font-size: 26px; line-height: 1; }
+.card-head .flag.has-flag { width: 34px; height: 25px; border-radius: 3px;
+  box-shadow: 0 0 0 1px var(--border-lit); }
 .src-tag { font-family: var(--mono); font-size: 10px; color: var(--text-faint); border: 1px solid var(--border);
   padding: 2px 7px; border-radius: 4px; }
 .card-body { padding: 16px 18px; }
@@ -407,10 +485,17 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
    Additions: flags, threat flagging, process, rule maker
    ============================================================ */
 
-/* country flag in the packet table */
+/* country flag in the packet table -- bundled SVGs (see setFlagIcon() in
+   app.js), not emoji: OS/browser flag-emoji rendering isn't reliable
+   (Windows never shipped flag glyphs; many Linux setups lack a
+   flag-capable emoji font either), so real icon assets are the only way
+   this reliably shows a flag instead of plain "US"/"FR" text everywhere. */
 .ip-flag { display: inline-block; width: 1.15em; margin-right: 5px; text-align: center;
   font-family: var(--sans); vertical-align: -1px; }
 .ip-flag.lan { color: var(--text-faint); font-size: 11px; }
+.ip-flag.has-flag, .flag.has-flag { background-size: cover; background-position: center;
+  background-repeat: no-repeat; border-radius: 2px; }
+.ip-flag.has-flag { height: 0.86em; }
 
 /* threat level on rows: a coloured left rail + dot */
 .pkt-row .c-num { position: relative; }
@@ -491,7 +576,7 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
 .filter-wrap { display: inline-flex; }
 #bpf-state.valid { color: var(--green); } #bpf-state.invalid { color: var(--red); }
 
-.strip-actions select#filter-preset { padding: 6px 8px; font-size: 12px; max-width: 190px; }
+.strip-actions select#filter-preset { padding: 6px 26px 6px 8px; font-size: 12px; max-width: 190px; }
 
 /* column resizers */
 .pkt-table thead th { position: relative; }
@@ -750,6 +835,9 @@ table.ir-table td input:focus, table.ir-table td textarea:focus, table.ir-table 
   font-family: var(--mono); font-size: 12.5px; display: flex; flex-direction: column; gap: 5px; }
 .mitm-info .k { display: inline-block; width: 74px; color: var(--text-dim); }
 .mitm-info .dim { color: var(--text-faint); }
+.mitm-warnings { margin-top: 10px; padding: 10px 12px; background: rgba(245,181,68,.08);
+  border: 1px solid rgba(245,181,68,.35); border-left: 3px solid var(--amber); border-radius: 8px;
+  font-size: 12px; color: var(--amber); line-height: 1.5; }
 .mitm-note { font-size: 12px; color: var(--text-dim); margin: 0 0 14px; line-height: 1.5; }
 .shape-presets { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .shape-presets .presets-label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint); }

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+ip_notes.json
+
+# PyInstaller build output (packaging/windows/build.bat)
+build/
+dist/
+
+# Inno Setup installer output (packaging/windows/build.bat)
+packaging/windows/Output/

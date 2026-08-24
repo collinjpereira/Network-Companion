@@ -19,8 +19,39 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
 
 import selftraffic
+
+
+class _SourcePortAdapter(HTTPAdapter):
+    """Forces outbound connections through a specific local port, so
+    capture.py's classify_self_traffic() can reliably recognise this
+    traffic as ours via selftraffic.is_self_port() — the same mechanism
+    crafter.py/scan.py/transfer.py already use. Matching purely on
+    ip-api.com's/AbuseIPDB's IP (the alternative, in classify_self_traffic)
+    is fragile: both are served from multiple/rotating IPs, so a request
+    can easily land on an IP a few minutes' stale DNS cache doesn't have,
+    and the traffic leaks into the analyst's real capture instead of NC
+    Traffic."""
+
+    def __init__(self, port, *args, **kwargs):
+        self._port = port
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["source_address"] = ("", self._port)
+        return super().init_poolmanager(*args, **kwargs)
+
+
+def _self_traffic_session() -> requests.Session:
+    port = selftraffic.reserve_local_port()
+    session = requests.Session()
+    adapter = _SourcePortAdapter(port)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
 
 IPAPI_URL = "http://ip-api.com/json/{ip}"
 IPAPI_FIELDS = ("status,message,continent,country,countryCode,region,regionName,"
@@ -57,7 +88,7 @@ def _is_private(ip: str) -> bool:
 
 def geolocate(ip: str) -> dict:
     try:
-        resp = requests.get(
+        resp = _self_traffic_session().get(
             IPAPI_URL.format(ip=ip),
             params={"fields": IPAPI_FIELDS},
             timeout=8,
@@ -96,7 +127,7 @@ def check_abuse(ip: str, api_key: Optional[str]) -> dict:
         return {"ok": False, "configured": False,
                 "error": "No AbuseIPDB API key set. Add one to enable abuse scoring."}
     try:
-        resp = requests.get(
+        resp = _self_traffic_session().get(
             ABUSEIPDB_URL,
             headers={"Key": key, "Accept": "application/json"},
             params={"ipAddress": ip, "maxAgeInDays": 90, "verbose": ""},
@@ -179,7 +210,7 @@ def batch_country(ips) -> dict:
         chunk = to_query[i:i + 100]
         payload = [{"query": ip, "fields": "countryCode,query,status"} for ip in chunk]
         try:
-            resp = requests.post(IPAPI_BATCH_URL, json=payload, timeout=8)
+            resp = _self_traffic_session().post(IPAPI_BATCH_URL, json=payload, timeout=8)
             data = resp.json()
             for entry in data:
                 ip = entry.get("query")
@@ -222,7 +253,7 @@ def batch_geo(ips) -> list:
         chunk = to_query[i:i + 100]
         payload = [{"query": ip, "fields": "status,query,lat,lon,country,countryCode,city"} for ip in chunk]
         try:
-            resp = requests.post(IPAPI_BATCH_URL, json=payload, timeout=10)
+            resp = _self_traffic_session().post(IPAPI_BATCH_URL, json=payload, timeout=10)
             data = resp.json()
             for entry in data:
                 ip = entry.get("query")

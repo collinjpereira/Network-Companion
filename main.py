@@ -95,6 +95,23 @@ if _auth and ":" in _auth:
     _u, _, _p = _auth.partition(":")
     app.add_middleware(BasicAuthMiddleware, user=_u, password=_p)
 
+
+@app.middleware("http")
+async def _no_cache(request, call_next):
+    """Never let the browser/webview cache anything from this server.
+
+    This is a purely local tool with no CDN or multi-user cache to benefit
+    from — the only effect caching has here is a stale static/*.js or
+    style.css surviving a restart and making a real fix look like it didn't
+    take effect.
+    """
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    for header in ("etag", "last-modified"):
+        if header in response.headers:
+            del response.headers[header]
+    return response
+
 # --- live packet fan-out ---------------------------------------------------
 # The Scapy sniffer runs in its own thread. We hand each packet to the asyncio
 # loop via call_soon_threadsafe, which drops it onto every connected client's
@@ -337,7 +354,7 @@ async def craft_send(req: CraftRequest):
 @app.post("/api/intel")
 async def intel(req: IntelRequest):
     try:
-        return intel_mod.lookup(req.ip, req.api_key)
+        return await asyncio.to_thread(intel_mod.lookup, req.ip, req.api_key)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
@@ -350,8 +367,13 @@ class FlagsRequest(BaseModel):
 
 @app.post("/api/geo-flags")
 async def geo_flags(req: FlagsRequest):
-    # Cap per request so a flood of unique IPs can't stall the loop.
-    return {"countries": intel_mod.batch_country(req.ips[:200])}
+    # Cap per request so a flood of unique IPs can't stall the loop, and
+    # run the blocking HTTP call in a thread -- this is `async def`, so
+    # without to_thread a slow/offline lookup would block the single event
+    # loop and freeze the whole app (live capture updates included), not
+    # just this endpoint.
+    countries = await asyncio.to_thread(intel_mod.batch_country, req.ips[:200])
+    return {"countries": countries}
 
 
 @app.post("/api/resolve")

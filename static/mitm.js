@@ -46,10 +46,22 @@
       info.innerHTML =
         `<div><span class="k">Target</span> ${escapeHtml(st.target)} <span class="dim">(${escapeHtml(st.target_mac || "?")})</span></div>` +
         `<div><span class="k">Gateway</span> ${escapeHtml(st.gateway)} <span class="dim">(${escapeHtml(st.gateway_mac || "?")})</span></div>` +
-        `<div><span class="k">Via</span> ${escapeHtml(st.iface || "?")} <span class="dim">(${escapeHtml(st.our_mac || "?")})</span> · ${st.bidirectional ? "both directions" : "target only"}</div>`;
+        `<div><span class="k">Via</span> ${escapeHtml(st.iface || "?")} <span class="dim">(${escapeHtml(st.our_mac || "?")})</span> · ${st.bidirectional ? "both directions" : "target only"}</div>` +
+        `<div><span class="k">ARP sent</span> ${st.arp_sent || 0} <span class="dim">forwarding: ${st.forwarding_ok ? "confirmed on" : "NOT confirmed (" + escapeHtml(st.platform || "?") + ")"}</span></div>`;
     } else {
       setState("idle", "");
       $("#mitm-info").hidden = true;
+    }
+    const warnBox = $("#mitm-warnings");
+    if (warnBox) {
+      const warnings = st.warnings || [];
+      if (warnings.length) {
+        warnBox.hidden = false;
+        warnBox.innerHTML = warnings.map(w => `<div>${escapeHtml(w)}</div>`).join("");
+      } else {
+        warnBox.hidden = true;
+        warnBox.innerHTML = "";
+      }
     }
     const sh = st.shaping;
     const ss = $("#shape-state");

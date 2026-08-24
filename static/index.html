@@ -221,11 +221,19 @@
               <th class="c-info">Why it's here</th>
             </tr>
           </thead>
-          <tbody id="nc-body"></tbody>
         </table>
-        <div class="table-empty" id="nc-empty">
-          <div class="empty-icon">◇</div>
-          <p>No Network Companion traffic seen yet.</p>
+        <div class="rows-scroll">
+          <table class="pkt-table">
+            <colgroup>
+              <col data-col="num" /><col data-col="time" /><col data-col="src" />
+              <col data-col="dst" /><col data-col="proto" /><col data-col="len" /><col data-col="reason" />
+            </colgroup>
+            <tbody id="nc-body"></tbody>
+          </table>
+          <div class="table-empty" id="nc-empty">
+            <div class="empty-icon">◇</div>
+            <p>No Network Companion traffic seen yet.</p>
+          </div>
         </div>
       </div>
     </div>
@@ -476,6 +484,7 @@
           <button class="btn btn-ghost" id="mitm-capture" disabled title="Jump to the Capture tab, filter to this target, and start recording">Capture this target</button>
         </div>
         <div class="mitm-info" id="mitm-info" hidden></div>
+        <div class="mitm-warnings" id="mitm-warnings" hidden></div>
       </section>
 
       <section class="mitm-card" id="shape-card">

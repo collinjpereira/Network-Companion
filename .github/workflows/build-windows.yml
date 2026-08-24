@@ -1,0 +1,37 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "**.py"
+      - "static/**"
+      - "packaging/windows/**"
+      - "requirements*.txt"
+      - ".github/workflows/build-windows.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          echo "C:\Program Files (x86)\Inno Setup 6" >> $env:GITHUB_PATH
+
+      - name: Build
+        shell: cmd
+        run: packaging\windows\build.bat
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NetworkCompanionSetup
+          path: packaging/windows/Output/NetworkCompanionSetup.exe

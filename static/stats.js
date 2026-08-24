@@ -1,7 +1,7 @@
 /* Statistics tab: everything here is computed client-side from
    state.packets, so it reflects whatever is loaded, a live capture or an
    opened PCAP. Relies on globals defined in app.js: $, $$, state,
-   escapeHtml, flagEmoji, flagByIp, hostByIp. */
+   escapeHtml, flagByIp, hostByIp. */
 
 /* Service names for the destination-port table. Mirrors the labels the
    backend uses in capture.py so a port maps to something readable. */
@@ -51,7 +51,9 @@ function currentStatsPackets() {
 function statIpCell(ip) {
   if (!ip) return '<span class="st-ip dim">-</span>';
   const cc = flagByIp[ip];
-  const flag = (cc && cc !== "PRIVATE") ? flagEmoji(cc) + " " : "";
+  const flag = (cc && cc !== "PRIVATE")
+    ? `<span class="ip-flag has-flag" style="background-image:url('/flags/${cc.toLowerCase()}.svg')"></span> `
+    : "";
   const label = (state.resolveDns && hostByIp[ip]) ? hostByIp[ip] : ip;
   const title = ' title="Filter the capture by ' + escapeHtml(ip) + '"';
   return '<span class="st-ip clickable" data-capfilter="host ' + escapeHtml(ip) + '"' + title + ">" + flag + escapeHtml(label) + "</span>";

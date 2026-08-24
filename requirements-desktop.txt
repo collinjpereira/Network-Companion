@@ -1,0 +1,10 @@
+# Extra dependencies for the desktop app (desktop.py) and its packaged
+# builds. Install alongside the normal requirements.txt:
+#
+#   pip install -r requirements.txt -r requirements-desktop.txt
+#
+# Linux also needs a system webview backend for pywebview (not a pip
+# package) — see packaging/linux/build.sh and the README for the exact
+# apt packages.
+pywebview>=4.4.1
+pyinstaller>=6.3.0

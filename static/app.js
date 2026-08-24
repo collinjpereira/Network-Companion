@@ -21,10 +21,38 @@ function isPrivateIp(ip) {
   const a = +m[1], b = +m[2];
   return a === 10 || a === 127 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254);
 }
-function flagEmoji(cc) {
-  if (!cc || cc.length !== 2) return "";
-  return cc.toUpperCase().replace(/./g, c => String.fromCodePoint(127397 + c.charCodeAt(0)));
+/* Flag *emoji* (regional-indicator sequences) render as plain "US"/"FR"
+   text instead of an actual flag on Windows (Segoe UI Emoji never shipped
+   flag glyphs) and on plenty of Linux setups without a flag-capable emoji
+   font installed. Bundled SVGs (static/flags/, from the MIT-licensed
+   flag-icons project) sidestep all of that -- same look everywhere. */
+function setFlagIcon(el, cc) {
+  if (cc && cc !== "PRIVATE" && cc.length === 2) {
+    el.style.backgroundImage = `url("/flags/${cc.toLowerCase()}.svg")`;
+    el.classList.add("has-flag");
+  } else {
+    el.style.backgroundImage = "";
+    el.classList.remove("has-flag");
+  }
 }
+
+/* In a real browser, target="_blank" links (AbuseIPDB reports, etc.) just
+   open a new tab on their own. Inside the desktop app's embedded webview
+   there's no "new tab" to open, so clicking them silently does nothing —
+   hand external links off to the system's actual default browser instead,
+   via the API desktop.py exposes. Checked at click time, not at load time,
+   since pywebview injects window.pywebview slightly after the page loads;
+   by the time a click happens it's always ready. Does nothing at all when
+   running as the plain web app (window.pywebview won't exist there). */
+document.addEventListener("click", (e) => {
+  if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.open_external) return;
+  const a = e.target.closest("a");
+  const href = a && a.getAttribute("href");
+  if (href && /^https?:\/\//i.test(href)) {
+    e.preventDefault();
+    window.pywebview.api.open_external(href);
+  }
+});
 
 /* ---------- tabs ---------- */
 let gmapAutoTried = false;
@@ -96,6 +124,16 @@ async function loadInterfaces() {
       if (craft) { const o2 = document.createElement("option"); o2.value = i.name; o2.textContent = label; craft.appendChild(o2); }
     });
     if (!sel.options.length) { const o = document.createElement("option"); o.textContent = "no interfaces found"; sel.appendChild(o); }
+    // WebKitGTK's native <select> widget can fail to repaint after being
+    // populated while its panel is already visible on screen (the Capture
+    // tab is active by default, unlike every other tab's panel, which
+    // starts hidden and only gets laid out -- and painted for the first
+    // time -- once you switch to it, by which point it's already
+    // populated). Forcing a reflow via a display toggle makes WebKitGTK
+    // re-sync the native widget to its actual content either way.
+    sel.style.display = "none";
+    void sel.offsetHeight;
+    sel.style.display = "";
   } catch (e) {}
 }
 
@@ -147,8 +185,7 @@ function cellLabel(ip) { return (state.resolveDns && hostByIp[ip]) ? hostByIp[ip
 function flagSpan(ip) {
   const s = document.createElement("span");
   s.className = "ip-flag"; s.dataset.ip = ip || "";
-  const cc = flagByIp[ip];
-  if (cc && cc !== "PRIVATE") s.textContent = flagEmoji(cc);
+  setFlagIcon(s, flagByIp[ip]);
   return s;
 }
 function addrCell(ip) {
@@ -391,10 +428,7 @@ async function resolveFlags() {
     const data = await r.json();
     Object.entries(data.countries || {}).forEach(([ip, code]) => {
       flagByIp[ip] = code;
-      if (code && code !== "PRIVATE") {
-        const emoji = flagEmoji(code);
-        $$(`.ip-flag[data-ip="${CSS.escape(ip)}"]`).forEach(el => { el.textContent = emoji; });
-      }
+      $$(`.ip-flag[data-ip="${CSS.escape(ip)}"]`).forEach(el => setFlagIcon(el, code));
     });
   } catch (e) {}
 }
@@ -437,10 +471,14 @@ async function selectPacket(n, tr, source) {
   $$(".pkt-row.selected").forEach(r => r.classList.remove("selected"));
   if (tr) tr.classList.add("selected");
   state.selected = n;
+  state.selectedSource = source;
   const url = source === "nc" ? "/api/nc/packet/" + n : "/api/packet/" + n;
   const r = await fetch(url);
   if (!r.ok) return;
   const d = await r.json();
+  // A newer selection may have landed while this fetch was in flight; don't
+  // let a slow, stale response clobber whatever the user is looking at now.
+  if (state.selected !== n || state.selectedSource !== source) return;
   const pkt = (source === "nc" ? ncState.packets : state.packets).find(p => p.number === n);
   d.rowThreat = pkt ? pkt.threat : d.threat;
   state.selectedDetail = d;
@@ -1112,6 +1150,11 @@ FILTER_GROUPS.forEach(g => g.items.forEach(([label, expr]) => { FILTER_PRESETS[l
     $("#display-filter").value = expr;
     updateDisplayFilter(expr);
   });
+  // Same WebKitGTK repaint issue as #iface (see loadInterfaces) -- this
+  // select is also on the Capture tab, visible immediately at page load.
+  sel.style.display = "none";
+  void sel.offsetHeight;
+  sel.style.display = "";
 })();
 
 /* ============================================================
@@ -1267,7 +1310,15 @@ function boolTag(v) { if (v === true) return `<span class="badge-yes">yes</span>
 function renderIntel(d) {
   $("#intel-empty").hidden = true; $("#intel-results").hidden = false;
   const geo = d.geo || {};
-  $("#loc-flag").textContent = geo.ok ? flagEmoji(geo.countryCode) : (d.private ? "🏠" : "🏳️");
+  const locFlag = $("#loc-flag");
+  if (geo.ok) {
+    locFlag.textContent = "";
+    setFlagIcon(locFlag, geo.countryCode);
+  } else {
+    locFlag.style.backgroundImage = "";
+    locFlag.classList.remove("has-flag");
+    locFlag.textContent = d.private ? "🏠" : "🏳️";
+  }
   if (geo.ok) {
     $("#loc-body").innerHTML =
       kv("IP", d.ip) + kv("Country", `${geo.country || "—"}${geo.countryCode ? " (" + geo.countryCode + ")" : ""}`) +
@@ -1372,7 +1423,79 @@ async function plotGlobalMap() {
 }
 $("#gmap-refresh").addEventListener("click", plotGlobalMap);
 
+/* Fully custom dropdown, used only for the two selects that turned out to
+   render broken as native widgets in WebKitGTK (desktop app on Linux) --
+   #iface and #filter-preset, both on the Capture tab, which is visible
+   immediately at page load unlike every other tab. This never touches a
+   native <select> control at all, so there is no native-widget rendering
+   path left for any engine to get wrong: the real <select> stays in the
+   DOM (invisible) purely so existing code reading `.value` or listening
+   for `change` keeps working untouched; a plain div/button UI drives it. */
+function enhanceSelect(selectEl, wrapClass) {
+  if (!selectEl || selectEl._ncEnhanced) return;
+  selectEl._ncEnhanced = true;
+
+  const wrap = document.createElement("div");
+  wrap.className = "ncsel" + (wrapClass ? " " + wrapClass : "");
+  selectEl.parentNode.insertBefore(wrap, selectEl);
+  wrap.appendChild(selectEl);
+  selectEl.classList.add("ncsel-real");
+  selectEl.tabIndex = -1;
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "ncsel-btn";
+  const list = document.createElement("div");
+  list.className = "ncsel-list";
+  list.hidden = true;
+  wrap.appendChild(btn);
+  wrap.appendChild(list);
+
+  function render() {
+    const opts = selectEl.options;
+    btn.textContent = opts.length ? (opts[selectEl.selectedIndex] || opts[0]).textContent : "";
+    list.innerHTML = "";
+    let flatIndex = 0;
+    [...selectEl.children].forEach(child => {
+      if (child.tagName === "OPTGROUP") {
+        const head = document.createElement("div");
+        head.className = "ncsel-group";
+        head.textContent = child.label;
+        list.appendChild(head);
+        [...child.children].forEach(opt => addItem(opt, flatIndex++));
+      } else if (child.tagName === "OPTION") {
+        addItem(child, flatIndex++);
+      }
+    });
+    function addItem(opt, idx) {
+      const item = document.createElement("div");
+      item.className = "ncsel-item" + (idx === selectEl.selectedIndex ? " active" : "");
+      item.textContent = opt.textContent;
+      item.addEventListener("click", () => {
+        selectEl.selectedIndex = idx;
+        selectEl.dispatchEvent(new Event("change", { bubbles: true }));
+        list.hidden = true;
+        render();
+      });
+      list.appendChild(item);
+    }
+  }
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    list.hidden = !list.hidden;
+  });
+  document.addEventListener("click", (e) => {
+    if (!wrap.contains(e.target)) list.hidden = true;
+  });
+  new MutationObserver(render).observe(selectEl, { childList: true, subtree: true });
+  selectEl.addEventListener("change", render);
+  render();
+}
+
 /* ---------- init ---------- */
+enhanceSelect($("#iface"), "ncsel-iface");
+enhanceSelect($("#filter-preset"), "ncsel-filterpreset");
 loadInterfaces();
 loadIpNotes();
 connectWS();

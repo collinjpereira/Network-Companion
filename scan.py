@@ -69,7 +69,11 @@ def parse_ports(spec: str):
         if "-" in part:
             a, b = part.split("-", 1)
             lo, hi = int(a), int(b)
-            for p in range(min(lo, hi), max(lo, hi) + 1):
+            # Clamp to the valid port range before expanding the range, so a
+            # spec like "1-4000000000" can't blow up into billions of set
+            # insertions before the final filter below ever runs.
+            lo, hi = max(1, min(lo, hi)), min(65535, max(lo, hi))
+            for p in range(lo, hi + 1):
                 ports.add(p)
         else:
             ports.add(int(part))

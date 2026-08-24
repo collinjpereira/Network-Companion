@@ -1,12 +1,26 @@
 # Network Companion
 
 A packet analyzer, packet crafter, and IP threat-intel console in one sleek
-local web UI. Built for SOC analysts doing malware triage and for network admins
-who want to sniff a link quickly. Formerly prototyped as "Osprey".
-
+local UI — run it as a web app in your browser, or as a native desktop app on
+Windows. Built for SOC analysts doing malware triage and for network admins
+who want to sniff a link quickly.
 
 <img width="1521" height="840" alt="Photo" src="https://github.com/user-attachments/assets/b6255ccd-a8a8-442e-9339-2ad5e714027c" />
 
+## Contents
+
+- [What it does](#what-it-does)
+- [Requirements](#requirements)
+- [Install & run](#install--run)
+- [Finding suspicious traffic quickly](#finding-suspicious-traffic-quickly)
+- [Keeping Network Companion's own traffic out of your capture](#keeping-network-companions-own-traffic-out-of-your-capture)
+- [Tagging and coloring IPs](#tagging-and-coloring-ips)
+- [Using it from another computer](#using-it-from-another-computer)
+- [Country flags and IP intel need internet](#country-flags-and-ip-intel-need-internet)
+- [Intercept / ARP](#capturing-traffic-from-another-device-on-your-lan-intercept--arp)
+- [Scope and intent](#scope-and-intent)
+- [Notes and limits](#notes-and-limits)
+- [Project layout](#project-layout)
 
 ## What it does
 
@@ -37,13 +51,16 @@ who want to sniff a link quickly. Formerly prototyped as "Osprey".
    categories are shown too.
 9. **NC Traffic tab.** Network Companion generates some real traffic of its
    own — IP-intel lookups, reverse-DNS for "Resolve names", its own UI, and
-   (best-effort) packets from the Crafter / Port Scan / Transfer tools. That
-   traffic is automatically diverted into its own **NC Traffic** tab instead
-   of flooding your capture, and is left out of the exported `.pcap` by
+   (best-effort) packets from the Port Scan / Transfer tools. That traffic is
+   automatically diverted into its own **NC Traffic** tab instead of
+   flooding your capture, and is left out of the exported `.pcap` by
    default. It still gets the full treatment, though: click a row for the
    same layer/hex/threat/process detail view as the main capture, with
    working Replay and Send to Crafter. See "Keeping Network Companion's own
-   traffic out of your capture" below.
+   traffic out of your capture" below. Packets sent from the **Crafter**
+   itself (including Replay) are exempt from this — they show up in the
+   normal capture like any other traffic, since when you're using the
+   Crafter that traffic usually *is* the thing you're trying to watch.
 10. **Per-IP tags and colors.** Right-click an address in the capture table
     to color it, tag it, and leave a description. Tagged IPs get a small dot
     next to the flag and a colored row marker everywhere they appear, and the
@@ -54,25 +71,100 @@ The UI is served on `127.0.0.1` only.
 
 ## Requirements
 
-- Linux or macOS (Windows works with Npcap installed)
+- Linux, macOS, or Windows
 - Python 3.9+
 - Root / administrator (raw sockets need it)
+- Windows only: [Npcap](https://npcap.com/), for raw packet access
 
 ## Install & run
 
+Two ways to run it, same backend and UI either way — pick one:
+
+| | Platforms | What you get |
+|---|---|---|
+| **[Desktop app](#desktop-app-windows)** | Windows only | A real window, no browser, no terminal after setup |
+| **[Web app](#web-app-linux-macos-windows)** | Linux, macOS, Windows | A local server you open in your browser |
+
+### Desktop app (Windows)
+
+> **TL;DR:** Download `NetworkCompanionSetup.exe`, install [Npcap](https://npcap.com/)
+> once if you haven't already, run the installer, done. No Python, no pip,
+> no build tools — Npcap is the only separate thing Windows users need.
+
+Most people just need one file: `NetworkCompanionSetup.exe`
+(`packaging\windows\Output\NetworkCompanionSetup.exe` in this repo, or
+whatever copy someone handed you). It's a normal Windows installer — no
+Python, no pip, no build tools needed on the machine that runs it.
+
+**How to run it:**
+
+**1.** Install [Npcap](https://npcap.com/) first, if it isn't already on
+that machine. This is the one thing the installer can't do for you — it's
+a system driver (not a Python package), so PyInstaller can't bundle it into
+the app. Use the default options during Npcap setup.
+
+**2.** Double-click `NetworkCompanionSetup.exe` and click through the
+installer. It installs to Program Files with its own icon, adds a Start
+Menu entry, adds a Desktop shortcut (you can uncheck this box if you don't
+want it), and registers a normal uninstaller (Settings → Apps).
+
+**3.** When it finishes, it offers to launch Network Companion right away —
+or open it later from the Desktop/Start Menu shortcut.
+
+**4.** Windows will show a UAC prompt on first launch (every launch,
+actually) — click **Yes**. Packet capture needs administrator rights; this
+is expected, not a warning sign.
+
+That's it — after that it's a normal window, no terminal, no console.
+To remove it later: Settings → Apps → Network Companion → Uninstall.
+
+#### Building the installer yourself
+
+Only needed if you're building `NetworkCompanionSetup.exe` for others to
+run, or you've changed the code. Requires Python 3.9+ and
+[Inno Setup](https://jrsoftware.org/isinfo.php) (its compiler, `iscc.exe`,
+needs to be on `PATH`) in addition to Npcap.
+
+```bat
+pip install -r requirements.txt -r requirements-desktop.txt
+packaging\windows\build.bat
+```
+
+This produces `dist\Network Companion.exe` (the standalone app) and
+`packaging\windows\Output\NetworkCompanionSetup.exe` (the installer to hand
+out). If Inno Setup isn't on `PATH`, only the first is built.
+
+> Prefer to skip building entirely? Just run `python desktop.py` — no
+> installer, no packaging, straight from source.
+
+### Web app (Linux, macOS, Windows)
+
+**1.** Get the code and set up a virtual environment:
 ```bash
 cd network-companion
-python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+```
 
-sed -i 's/\r$//' run.sh
+**2.** Run it.
+
+Linux/macOS:
+```bash
 chmod +x run.sh
-
 sudo ./run.sh
 ```
 
-Then open http://127.0.0.1:8787. Without root the UI still loads and IP intel
-still works; capture, send, and process attribution need root.
+Windows (install [Npcap](https://npcap.com/) first, then run this terminal
+as Administrator):
+```bat
+python -m uvicorn main:app --host 127.0.0.1 --port 8787
+```
+
+**3.** Open **http://127.0.0.1:8787** in a browser.
+
+Without root/Administrator the UI still loads and IP intel still works;
+capture, packet sending, process attribution, and Intercept all need it.
 
 ## Finding suspicious traffic quickly
 
@@ -94,10 +186,12 @@ When you capture on a real interface, Network Companion's own background
 activity shows up on the wire like anything else: IP-intel lookups to
 ip-api.com / AbuseIPDB, reverse-DNS queries from the **Resolve names**
 toggle, the browser↔server UI traffic, and (best-effort) packets sent by the
-Crafter, Port Scan, and Transfer tools. All of that is automatically
-recognized and routed into the **NC Traffic** tab instead of the main
-Capture table, so it doesn't flood the view of the traffic you actually came
-to look at.
+Port Scan and Transfer tools. All of that is automatically recognized and
+routed into the **NC Traffic** tab instead of the main Capture table, so it
+doesn't flood the view of the traffic you actually came to look at. Traffic
+sent from the **Crafter** (including Replay) is deliberately left out of
+this — it lands in the main Capture table like anything else, since that's
+usually the traffic you're actively trying to watch.
 
 - **Excluded from the saved capture by default.** `Export .pcap` only ever
   contains the main Capture table — NC Traffic is a separate buffer, not a
@@ -122,14 +216,15 @@ to look at.
   opt in.
 - **What isn't covered:** `netdiscover`'s ARP/ping sweep (ARP has no port to
   key off, and blanket-matching it would also hide real ARP traffic from
-  other hosts during a promiscuous capture) and the Intercept (MITM)
-  feature's relayed traffic, which is deliberately left visible since seeing
-  the victim's real traffic is the entire point of that tool. Port scans
-  (connect-scan) and file transfers are classified best-effort: the OS picks
-  the local port before Python regains control, so the handshake may land in
-  the main capture even though the rest of the flow is correctly diverted; a
-  SYN scan or a Crafter send is fully reliable since Network Companion
-  chooses the source port itself before sending.
+  other hosts during a promiscuous capture), the Intercept (MITM) feature's
+  relayed traffic (deliberately left visible since seeing the victim's real
+  traffic is the entire point of that tool), and anything sent from the
+  Crafter (by design — see above). Port scans (connect-scan) and file
+  transfers are classified best-effort: the OS picks the local port before
+  Python regains control, so the handshake may land in the main capture even
+  though the rest of the flow is correctly diverted; a SYN scan is fully
+  reliable since Network Companion chooses the source port itself before
+  sending.
 
 ## Tagging and coloring IPs
 
@@ -186,30 +281,52 @@ crafting, threat flagging, and process attribution all work with no network.
 For **offline flags**, drop a MaxMind `GeoLite2-Country.mmdb` beside the app and
 switch `intel.batch_country` to read it (a small change; left as an opt-in).
 
-## Capturing traffic from another device (and a note on ARP)
+## Capturing traffic from another device on your LAN (Intercept / ARP)
 
-You asked about OctoSniff-style ARP interception to sniff a console like a
-PlayStation. I deliberately did **not** build that. ARP spoofing works by
-telling other devices your machine is the gateway so their traffic is
-redirected through you. Even on your own LAN it means silently intercepting
-devices that never consented, and the same button would just as happily target
-a roommate, a guest, or another player. That crosses from passive analysis into
-active interception of third parties, so it's out of scope for this tool.
+The **Intercept** tab does real ARP-cache poisoning: it tells the target that
+this machine is its gateway (and, optionally, tells the gateway that this
+machine is the target), turns on IP forwarding for the duration so the target
+stays online while its traffic routes through this host, and heals both ARP
+caches and restores forwarding the moment you stop (also done automatically on
+server shutdown, so it never leaves a network mid-poison). Once traffic is
+flowing through this host, the normal capture engine sees it like anything
+else — start a capture on the same interface (the "Capture this target" button
+does this for you) and it lands in the live table and PCAP export.
 
-The good news is there's a clean way to see your **own** console's traffic that
-doesn't touch anyone else's:
+This is a genuine on-path (MITM) attack technique, not a toy. **Only ever point
+it at a device you own or a network/engagement you're explicitly authorised to
+test** — intercepting someone else's traffic without consent (a roommate's
+laptop, another player's console, a guest on your Wi-Fi) is illegal in most
+places and is exactly the kind of use this tool is not for. The UI requires an
+explicit confirmation naming the target before it will start.
+
+**If it seems like nothing is happening:** the interface returns `forwarding_ok`
+and a list of `warnings` (shown inline in the Intercept tab) precisely because
+the most common failure mode is silent — poisoning succeeds but the target's
+traffic is never actually relayed. Concretely:
+
+- **Not running with root/administrator** — Scapy can't open a raw socket to
+  resolve MACs or send poisoned ARP replies, and the UI now reports this as
+  "needs sudo" instead of the misleading "target didn't answer."
+- **IP forwarding didn't turn on.** Handled precisely on Linux (the real
+  `/proc/sys/net/ipv4/ip_forward` value is read, set, and restored). On macOS
+  and Windows it's best-effort (`sysctl` / `netsh`); if it can't be confirmed,
+  a warning says so rather than pretending it worked.
+- **Target and gateway must be different, reachable, real devices** — the tool
+  now refuses to poison this machine's own address, and refuses to proceed if
+  a resolved MAC turns out to be this machine's own MAC (usually means the IPs
+  were mixed up).
+
+If you'd rather not touch ARP at all, there are consent-clean alternatives that
+give full visibility into a device you own:
 
 - **Put the analysis box in the path.** Share your laptop's connection or run a
   small Linux box / Raspberry Pi / travel router as the access point or gateway
-  the console connects through, then capture on that interface. This only sees
-  devices that choose to connect through you, which is exactly the consent
-  boundary.
-- **Port mirroring / SPAN** on a managed switch: mirror the console's port to
+  the device connects through, then capture on that interface.
+- **Port mirroring / SPAN** on a managed switch, mirroring the device's port to
   the analysis host's port.
 - **Capture at the router** if it supports it (many do; OpenWrt can run tcpdump
   or mirror a port).
-
-Any of these gives full visibility into a device you own without ARP poisoning.
 
 ## Scope and intent
 
@@ -232,17 +349,27 @@ point it only at systems you own or have permission to test.
 
 ```
 network-companion/
-├── main.py         FastAPI server: UI, REST API, WebSocket stream
-├── capture.py      Scapy capture engine + packet serialisation
-├── threat.py       heuristic threat scoring + scan detection
-├── procmap.py      local process attribution (psutil)
-├── crafter.py      builds and sends custom packets
-├── intel.py        geolocation, abuse, and batch country flags
-├── selftraffic.py  registry Network Companion's own senders mark before
-│                   sending, so capture.py can divert that traffic to NC Traffic
-├── ipnotes.py      loads/saves per-IP tags, colors, and descriptions
-├── ip_notes.json   the saved-IP notes themselves (created on first save)
-├── run.sh          root-check launcher
+├── main.py                FastAPI server: UI, REST API, WebSocket stream
+├── capture.py             Scapy capture engine + packet serialisation
+├── threat.py              heuristic threat scoring + scan detection
+├── procmap.py             local process attribution (psutil)
+├── crafter.py             builds and sends custom packets
+├── intel.py               geolocation, abuse, and batch country flags
+├── mitm.py                ARP-poisoning Intercept engine + traffic shaping (tc)
+├── scan.py                TCP connect / SYN port scanning
+├── netdiscover.py         local-subnet ARP/ping sweep + device-type guesses
+├── transfer.py            raw TCP/TLS/FTP send-data and file-transfer tools
+├── selftraffic.py         registry Network Companion's own senders mark before
+│                          sending, so capture.py can divert that traffic to NC Traffic
+├── ipnotes.py             loads/saves per-IP tags, colors, and descriptions
+├── ip_notes.json          the saved-IP notes themselves (created on first save)
+├── run.sh                 root-check launcher (browser / web-app mode)
+├── desktop.py             Windows desktop-app launcher (pywebview window, self-elevating)
 ├── requirements.txt
-└── static/         index.html, style.css, app.js
+├── requirements-desktop.txt   extra deps for desktop.py and its packaged build
+├── packaging/
+│   └── windows/           PyInstaller spec, Inno Setup installer, app icon,
+│                          and build.bat producing NetworkCompanionSetup.exe
+└── static/                index.html, style.css, app.js, and per-tab scripts
+                           (stats.js, nmap.js, ir.js, netscan.js, mitm.js)
 ```

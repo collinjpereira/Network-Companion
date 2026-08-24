@@ -97,15 +97,17 @@ def is_pending_ptr(ip: str) -> bool:
 
 def _resolve_host(host: str) -> set:
     now = time.time()
-    cached = _host_cache.get(host)
-    if cached and cached[1] > now:
-        return cached[0]
+    with _lock:
+        cached = _host_cache.get(host)
+        if cached and cached[1] > now:
+            return cached[0]
     try:
         infos = socket.getaddrinfo(host, None)
         ips = {info[4][0] for info in infos}
     except Exception:
         ips = cached[0] if cached else set()
-    _host_cache[host] = (ips, now + HOST_TTL)
+    with _lock:
+        _host_cache[host] = (ips, now + HOST_TTL)
     return ips
 
 

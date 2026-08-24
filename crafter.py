@@ -19,9 +19,9 @@ from scapy.layers.inet import IP, TCP, UDP, ICMP
 from scapy.layers.inet6 import IPv6
 from scapy.packet import Raw
 
-import selftraffic
-
-_mac_cache: dict = {}
+_MAC_CACHE_TTL = 120.0  # seconds; a stale entry after a DHCP/NIC change would
+                        # otherwise misdirect every future spoofed-source send
+_mac_cache: dict = {}   # (ip, iface) -> (mac, expiry epoch)
 
 
 def _arp_target_and_iface(dst_ip: str, iface):
@@ -41,8 +41,9 @@ def _arp_target_and_iface(dst_ip: str, iface):
 
 def _resolve_mac(target_ip: str, iface) -> Optional[str]:
     key = (target_ip, iface)
-    if key in _mac_cache:
-        return _mac_cache[key]
+    cached = _mac_cache.get(key)
+    if cached and cached[1] > time.time():
+        return cached[0]
     mac = None
     try:
         ans = srp1(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=target_ip),
@@ -52,7 +53,7 @@ def _resolve_mac(target_ip: str, iface) -> Optional[str]:
     except Exception:
         mac = None
     if mac:
-        _mac_cache[key] = mac
+        _mac_cache[key] = (mac, time.time() + _MAC_CACHE_TTL)
     return mac
 
 
@@ -146,18 +147,6 @@ def _build(spec: dict):
     return pkt, uses_l2, ip_src_set, ipv4_dst
 
 
-def _mark_self(pkt, ttl: float):
-    """Register this packet's TCP/UDP source port so the capture engine can
-    recognise it as Network Companion's own traffic (see selftraffic.py)."""
-    try:
-        if pkt.haslayer(TCP):
-            selftraffic.mark_port(pkt[TCP].sport, ttl=ttl)
-        elif pkt.haslayer(UDP):
-            selftraffic.mark_port(pkt[UDP].sport, ttl=ttl)
-    except Exception:
-        pass
-
-
 def craft_and_send(spec: dict) -> dict:
     """Build and transmit a packet. Returns a summary of what was sent.
 
@@ -195,7 +184,6 @@ def craft_and_send(spec: dict) -> dict:
         pkt = Ether(dst=mac) / pkt
         uses_l2 = True
 
-    _mark_self(pkt, ttl=max(10.0, count * interval + 5.0))
     start = time.time()
     if uses_l2:
         sendp(pkt, count=count, inter=interval, iface=iface, verbose=False)
@@ -225,7 +213,6 @@ def resend(pkt, count: int = 1, interval: float = 0.0, iface=None) -> dict:
     if count < 1 or count > 1000:
         raise ValueError("Count must be between 1 and 1000.")
     has_l2 = pkt.haslayer(Ether)
-    _mark_self(pkt, ttl=max(10.0, count * interval + 5.0))
     start = time.time()
     if has_l2:
         sendp(pkt, count=count, inter=interval, iface=iface, verbose=False)
