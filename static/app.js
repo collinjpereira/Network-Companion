@@ -6,9 +6,15 @@ const ET_FMT = new Intl.DateTimeFormat("en-US", {
   timeZone: "America/New_York", hour12: false,
   hour: "2-digit", minute: "2-digit", second: "2-digit",
 });
+/* Intl formatting is slow enough to show up when thousands of rows arrive at
+   once, and packets arrive in runs within the same second, so reuse the last
+   formatted second. */
+let etLastSec = null, etLastStr = "";
 function etTime(epoch) {
+  const sec = Math.floor(epoch);
+  if (sec !== etLastSec) { etLastSec = sec; etLastStr = ET_FMT.format(new Date(sec * 1000)); }
   const ms = String(Math.floor((epoch % 1) * 1000)).padStart(3, "0");
-  return ET_FMT.format(new Date(epoch * 1000)) + "." + ms;
+  return etLastStr + "." + ms;
 }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -70,6 +76,11 @@ function activateTab(name) {
       targetBody.appendChild(splitter);
       targetBody.appendChild(detail);
     }
+    // Scrolling has no effect while a tab is hidden, so catch the table up
+    // to whatever arrived in the meantime.
+    const table = name === "nc" ? ncTable : capTable;
+    if (table.following) table.scroll.scrollTop = table.scroll.scrollHeight;
+    table.render(false);
   }
   if (name === "intel") {
     if (map) setTimeout(() => map.invalidateSize(), 60);
@@ -90,7 +101,6 @@ const state = {
   flaggedOnly: false, resolveDns: false,
   displayPredicate: () => true,
   protoCounts: {}, rateWindow: [],
-  maxRows: 5000,
   ipNotes: {},
 };
 
@@ -144,7 +154,7 @@ function setStatus(kind, text) {
 
 function resetBuffer() {
   state.packets = []; state.buffer = []; state.protoCounts = {}; state.rateWindow = [];
-  els.body.innerHTML = ""; els.empty.hidden = false;
+  capTable.setRows([]); els.empty.hidden = false;
   $("#detail-content").hidden = true; $("#detail-empty").hidden = false;
 }
 
@@ -370,7 +380,8 @@ function visible(pkt) {
 function makeRow(pkt, isNew) {
   const tr = document.createElement("tr");
   const lvl = pkt.threat ? pkt.threat.level : "none";
-  tr.className = "pkt-row" + (isNew ? " new-row" : "") + (lvl !== "none" ? " t-" + lvl : "");
+  tr.className = "pkt-row" + (isNew ? " new-row" : "") + (lvl !== "none" ? " t-" + lvl : "")
+    + (state.selected === pkt.number && state.selectedSource === "capture" ? " selected" : "");
   tr.dataset.n = pkt.number;
 
   const num = document.createElement("td"); num.className = "c-num"; num.textContent = pkt.number;
@@ -384,7 +395,6 @@ function makeRow(pkt, isNew) {
   if (lvl !== "none") { const d = document.createElement("span"); d.className = "tdot t-" + lvl; info.appendChild(d); }
 
   tr.append(num, time, src, dst, proto, len, info);
-  tr.addEventListener("click", () => selectPacket(pkt.number, tr));
   const tagColor = rowTagColor(pkt);
   if (tagColor) {
     const mark = document.createElement("span");
@@ -394,28 +404,134 @@ function makeRow(pkt, isNew) {
   return tr;
 }
 
+/* ---------- virtualised packet table ----------
+   A plain <table> holding thousands of rows gets re-laid out in full every
+   time rows are added, which made the UI lag from a couple of thousand
+   packets onward. Instead, only the rows in (or near) the viewport exist in
+   the DOM, with two spacer rows standing in for everything above and below,
+   so the cost of an update no longer grows with the size of the capture and
+   every packet stays scrollable (no more 5000-row cap). Rows are a fixed
+   height (nowrap cells), measured from the first real row. */
+const VT_OVERSCAN = 20;  // extra rows rendered above/below the viewport
+
+class VirtualTable {
+  constructor(scrollEl, tbody, makeRowFn, cols) {
+    this.scroll = scrollEl; this.body = tbody; this.makeRow = makeRowFn;
+    this.rows = []; this.rowH = 25; this.measured = false;
+    this.start = 0; this.end = 0;  // rendered range [start, end)
+    // Whether new rows should be followed. Tracked from scroll events rather
+    // than recomputed on append, since appending grows the bottom spacer
+    // without the user having scrolled away.
+    this.following = true;
+    this.top = this._spacer(cols); this.bottom = this._spacer(cols);
+    this.body.replaceChildren(this.top, this.bottom);
+    this.scroll.addEventListener("scroll", () => { this.following = this.atBottom(); this._schedule(); }, { passive: true });
+    // Also fires when a hidden tab is shown again; scrolling can't take
+    // effect while hidden, so re-pin to the newest rows then.
+    new ResizeObserver(() => {
+      if (this.following) this.scroll.scrollTop = this.scroll.scrollHeight;
+      this._schedule();
+    }).observe(this.scroll);
+  }
+  _spacer(cols) {
+    const tr = document.createElement("tr"); tr.className = "vt-spacer";
+    const td = document.createElement("td"); td.colSpan = cols;
+    tr.appendChild(td); return tr;
+  }
+  _schedule() {
+    if (this._raf) return;
+    this._raf = requestAnimationFrame(() => { this._raf = 0; this.render(false); });
+  }
+  atBottom() { return this.scroll.scrollHeight - this.scroll.scrollTop - this.scroll.clientHeight < 60; }
+  /* Replace every row (filter change, PCAP load, clear). */
+  setRows(rows) {
+    this.rows = rows;
+    if (!rows.length) this.following = true;
+    this.start = this.end = 0;
+    this.body.replaceChildren(this.top, this.bottom);
+    this.render(false);
+  }
+  /* Add new rows at the end, following them if the view was at the bottom. */
+  append(rows, flash) {
+    if (!rows.length) return;
+    for (const r of rows) this.rows.push(r);
+    this._sizeSpacers();
+    if (this.following) this.scroll.scrollTop = this.scroll.scrollHeight;
+    this.render(flash);
+  }
+  /* Rebuild the rendered rows in place (tag colours, resolved names). */
+  refresh() { const keep = this.rows; this.setRows(keep); }
+  _sizeSpacers() {
+    this.top.firstChild.style.height = (this.start * this.rowH) + "px";
+    this.bottom.firstChild.style.height = (Math.max(0, this.rows.length - this.end) * this.rowH) + "px";
+  }
+  render(flash) {
+    const n = this.rows.length;
+    const view = this.scroll.clientHeight || 600;
+    let s = Math.max(0, Math.floor(this.scroll.scrollTop / this.rowH) - VT_OVERSCAN);
+    let e = Math.min(n, Math.ceil((this.scroll.scrollTop + view) / this.rowH) + VT_OVERSCAN);
+    if (s > e) s = e;
+    if (s >= this.end || e <= this.start) {
+      // No overlap with what's rendered: rebuild the window.
+      while (this.top.nextSibling !== this.bottom) this.top.nextSibling.remove();
+      const frag = document.createDocumentFragment();
+      for (let i = s; i < e; i++) frag.appendChild(this.makeRow(this.rows[i], flash));
+      this.bottom.before(frag);
+    } else {
+      // Overlap: trim / extend each end, keeping existing row elements.
+      for (let i = this.start; i < s; i++) this.top.nextSibling.remove();
+      for (let i = e; i < this.end; i++) this.bottom.previousSibling.remove();
+      if (s < this.start) {
+        const frag = document.createDocumentFragment();
+        for (let i = s; i < this.start; i++) frag.appendChild(this.makeRow(this.rows[i], false));
+        this.top.after(frag);
+      }
+      if (e > this.end) {
+        const frag = document.createDocumentFragment();
+        for (let i = Math.max(this.end, s); i < e; i++) frag.appendChild(this.makeRow(this.rows[i], flash));
+        this.bottom.before(frag);
+      }
+    }
+    this.start = s; this.end = e;
+    this._sizeSpacers();
+    if (!this.measured && e > s) {
+      const h = this.top.nextSibling.getBoundingClientRect().height;
+      if (h > 0) { this.measured = true; if (Math.abs(h - this.rowH) > 0.1) {
+        this.rowH = h; this._sizeSpacers();
+        if (this.following) this.scroll.scrollTop = this.scroll.scrollHeight;
+        this._schedule();
+      } }
+    }
+  }
+}
+
+/* Above this many new rows in one flush, skip the "new row" flash: animating
+   lots of rows at once costs more than it's worth and nobody can see
+   individual rows at that rate anyway. */
+const FLASH_LIMIT = 200;
+
+const capTable = new VirtualTable(els.scroll, els.body, makeRow, 7);
+
 function flushBuffer() {
   if (!state.buffer.length || state.paused) return;
-  const atBottom = els.scroll.scrollHeight - els.scroll.scrollTop - els.scroll.clientHeight < 60;
-  const frag = document.createDocumentFragment();
-  let added = 0;
-  for (const pkt of state.buffer) if (visible(pkt)) { frag.appendChild(makeRow(pkt, true)); added++; }
+  const matched = [];
+  for (const pkt of state.buffer) if (visible(pkt)) matched.push(pkt);
   state.buffer = [];
-  if (added) {
-    els.empty.hidden = true;
-    els.body.appendChild(frag);
-    while (els.body.children.length > state.maxRows) els.body.removeChild(els.body.firstChild);
-    if (atBottom) els.scroll.scrollTop = els.scroll.scrollHeight;
-  }
+  if (!matched.length) return;
+  els.empty.hidden = true;
+  capTable.append(matched, matched.length <= FLASH_LIMIT);
 }
 setInterval(flushBuffer, 200);
 
+/* One click handler for the whole table instead of one per row. */
+els.body.addEventListener("click", e => {
+  const tr = e.target.closest(".pkt-row");
+  if (tr) selectPacket(+tr.dataset.n, tr);
+});
+
 function rerenderTable() {
-  els.body.innerHTML = "";
-  const frag = document.createDocumentFragment();
   const matched = state.packets.filter(visible);
-  matched.slice(-state.maxRows).forEach(p => frag.appendChild(makeRow(p, false)));
-  els.body.appendChild(frag);
+  capTable.setRows(matched);
   els.empty.hidden = matched.length > 0;
 }
 
@@ -452,8 +568,10 @@ setInterval(resolveNames, 1200);
 function updateStats() {
   els.count.textContent = state.packets.length.toLocaleString();
   const now = Date.now();
-  state.rateWindow = state.rateWindow.filter(t => now - t < 2000);
-  els.rate.innerHTML = Math.round(state.rateWindow.length / 2) + "<em>/s</em>";
+  // rateWindow holds [timestamp, packetCount] per received batch.
+  state.rateWindow = state.rateWindow.filter(b => now - b[0] < 2000);
+  const recent = state.rateWindow.reduce((a, b) => a + b[1], 0);
+  els.rate.innerHTML = Math.round(recent / 2) + "<em>/s</em>";
   const total = Object.values(state.protoCounts).reduce((a, b) => a + b, 0) || 1;
   els.protoBar.innerHTML = "";
   Object.entries(state.protoCounts).sort((a, b) => b[1] - a[1]).forEach(([p, c]) => {
@@ -635,21 +753,27 @@ document.addEventListener("click", e => {
 function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  // The server sends packets in batches (a JSON array per message).
   ws.onmessage = ev => {
-    const pkt = JSON.parse(ev.data);
-    if (pkt.channel === "nc") {
-      ncState.packets.push(pkt);
-      ncState.buffer.push(pkt);
+    const data = JSON.parse(ev.data);
+    const batch = Array.isArray(data) ? data : [data];
+    let captured = 0;
+    for (const pkt of batch) {
+      if (pkt.channel === "nc") {
+        ncState.packets.push(pkt);
+        ncState.buffer.push(pkt);
+        noteFlag(pkt.src); noteFlag(pkt.dst);
+        continue;
+      }
+      // Unbounded on purpose: nothing gets dropped from a running capture.
+      state.packets.push(pkt);
+      state.buffer.push(pkt);
+      state.protoCounts[pkt.proto] = (state.protoCounts[pkt.proto] || 0) + 1;
+      captured++;
       noteFlag(pkt.src); noteFlag(pkt.dst);
-      return;
+      if (state.resolveDns) { noteName(pkt.src); noteName(pkt.dst); }
     }
-    // Unbounded on purpose: nothing gets dropped from a running capture.
-    state.packets.push(pkt);
-    state.buffer.push(pkt);
-    state.protoCounts[pkt.proto] = (state.protoCounts[pkt.proto] || 0) + 1;
-    state.rateWindow.push(Date.now());
-    noteFlag(pkt.src); noteFlag(pkt.dst);
-    if (state.resolveDns) { noteName(pkt.src); noteName(pkt.dst); }
+    if (captured) state.rateWindow.push([Date.now(), captured]);
   };
   ws.onclose = () => setTimeout(connectWS, 1500);
 }
@@ -818,7 +942,8 @@ applyNcVisibility();
 
 function makeNcRow(pkt) {
   const tr = document.createElement("tr");
-  tr.className = "pkt-row"; tr.dataset.n = pkt.number;
+  tr.className = "pkt-row" + (state.selected === pkt.number && state.selectedSource === "nc" ? " selected" : "");
+  tr.dataset.n = pkt.number;
   const num = document.createElement("td"); num.className = "c-num"; num.textContent = pkt.number;
   const time = document.createElement("td"); time.className = "c-time"; time.textContent = etTime(pkt.epoch);
   const src = addrCell(pkt.src);
@@ -828,34 +953,35 @@ function makeNcRow(pkt) {
   const info = document.createElement("td"); info.className = "c-info"; info.title = pkt.reason || "";
   info.textContent = pkt.reason || "";
   tr.append(num, time, src, dst, proto, len, info);
-  tr.addEventListener("click", () => selectPacket(pkt.number, tr, "nc"));
   return tr;
 }
 
+const ncTable = new VirtualTable(ncEls.body.closest(".rows-scroll"), ncEls.body, makeNcRow, 7);
+
 function flushNcBuffer() {
   if (!ncState.buffer.length) return;
-  const frag = document.createDocumentFragment();
-  for (const pkt of ncState.buffer) frag.appendChild(makeNcRow(pkt));
+  const rows = ncState.buffer;
   ncState.buffer = [];
   ncEls.empty.hidden = true;
-  ncEls.body.appendChild(frag);
-  while (ncEls.body.children.length > state.maxRows) ncEls.body.removeChild(ncEls.body.firstChild);
+  ncTable.append(rows, false);
   updateNcBadges();
 }
 setInterval(flushNcBuffer, 200);
 
+ncEls.body.addEventListener("click", e => {
+  const tr = e.target.closest(".pkt-row");
+  if (tr) selectPacket(+tr.dataset.n, tr, "nc");
+});
+
 function rerenderNcTable() {
-  ncEls.body.innerHTML = "";
-  const frag = document.createDocumentFragment();
-  ncState.packets.slice(-state.maxRows).forEach(p => frag.appendChild(makeNcRow(p)));
-  ncEls.body.appendChild(frag);
+  ncTable.setRows(ncState.packets.slice());
   ncEls.empty.hidden = ncState.packets.length > 0;
 }
 
 $("#nc-clear-btn").addEventListener("click", async () => {
   await fetch("/api/nc/clear", { method: "POST" });
   ncState.packets = []; ncState.buffer = [];
-  ncEls.body.innerHTML = ""; ncEls.empty.hidden = false;
+  ncTable.setRows([]); ncEls.empty.hidden = false;
   updateNcBadges();
 });
 $("#nc-jump").addEventListener("click", () => activateTab("nc"));
@@ -863,7 +989,7 @@ $("#nc-jump").addEventListener("click", () => activateTab("nc"));
 async function deleteNcPacket(n, tr) {
   try { await fetch("/api/nc/packet/" + n, { method: "DELETE" }); } catch (e) {}
   ncState.packets = ncState.packets.filter(p => p.number !== n);
-  if (tr) tr.remove();
+  rerenderNcTable();
   updateNcBadges();
 }
 
@@ -1358,13 +1484,24 @@ function renderThreat(abuse, ip, isPriv) {
     kv("Usage type", abuse.usageType || "—") + cats + link;
 }
 
+/* Map background. CARTO's basemaps used to be keyless but now return
+   "API key required" tiles, so use Esri's dark gray canvas (no key needed;
+   attribution required, hence the attribution control) plus its label layer. */
+const ESRI_TILES = "https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/";
+function addBaseTiles(m) {
+  m.attributionControl.setPrefix(false);
+  L.tileLayer(ESRI_TILES + "World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+    { maxZoom: 16, attribution: "Tiles &copy; Esri &mdash; Esri, HERE, Garmin, OpenStreetMap contributors" }).addTo(m);
+  L.tileLayer(ESRI_TILES + "World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}", { maxZoom: 16 }).addTo(m);
+}
+
 function renderMap(geo) {
   const card = $(".map-card");
   if (typeof L === "undefined" || !geo.ok || geo.lat == null) { card.style.display = "none"; return; }
   card.style.display = "block";
   if (!map) {
-    map = L.map("map", { attributionControl: false, zoomControl: true });
-    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { subdomains: "abcd", maxZoom: 12 }).addTo(map);
+    map = L.map("map", { zoomControl: true });
+    addBaseTiles(map);
   }
   map.setView([geo.lat, geo.lon], 6);
   if (mapMarker) map.removeLayer(mapMarker);
@@ -1399,8 +1536,8 @@ async function plotGlobalMap() {
     const data = await r.json();
     const points = data.points || [];
     if (!gmapInstance) {
-      gmapInstance = L.map("gmap", { attributionControl: false, zoomControl: true, worldCopyJump: true }).setView([20, 0], 2);
-      L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { subdomains: "abcd", maxZoom: 12 }).addTo(gmapInstance);
+      gmapInstance = L.map("gmap", { zoomControl: true, worldCopyJump: true }).setView([20, 0], 2);
+      addBaseTiles(gmapInstance);
     }
     gmapDots.forEach(m => gmapInstance.removeLayer(m));
     gmapDots = points.map(pt => {

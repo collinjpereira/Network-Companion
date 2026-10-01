@@ -13,7 +13,7 @@ just comes with a plain-English reason so you can judge it yourself.
 import time
 import math
 import threading
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 
 from scapy.layers.inet import TCP, UDP, ICMP, IP
 from scapy.layers.inet6 import IPv6
@@ -64,23 +64,39 @@ class ScanTracker:
 
     def __init__(self):
         self._lock = threading.Lock()
-        # src -> deque[(ts, dst_ip, dst_port)]
-        self._events = defaultdict(deque)
+        # src -> (deque[(ts, dst_ip, dst_port)], Counter of ports, Counter of hosts).
+        # The counters are kept in step with the deque so each SYN costs O(1)
+        # instead of rebuilding sets from the whole window, which got
+        # quadratic during exactly the floods / scans this exists to catch.
+        self._events = {}
 
     def record(self, src, dst, dport):
         now = time.time()
         with self._lock:
-            if src not in self._events and len(self._events) >= self.MAX_SOURCES:
-                # Drop the largest bucket to make room rather than grow forever.
-                victim = max(self._events, key=lambda k: len(self._events[k]))
-                del self._events[victim]
-            dq = self._events[src]
+            entry = self._events.get(src)
+            if entry is None:
+                if len(self._events) >= self.MAX_SOURCES:
+                    # Evict the least recently active source (dicts keep
+                    # insertion order and active sources are re-inserted
+                    # below) rather than grow forever.
+                    del self._events[next(iter(self._events))]
+                entry = (deque(), Counter(), Counter())
+            else:
+                del self._events[src]
+            self._events[src] = entry
+            dq, ports, hosts = entry
             dq.append((now, dst, dport))
+            ports[dport] += 1
+            hosts[dst] += 1
             cutoff = now - self.WINDOW
             while dq and dq[0][0] < cutoff:
-                dq.popleft()
-            ports = {p for _, _, p in dq}
-            hosts = {h for _, h, _ in dq}
+                _, old_host, old_port = dq.popleft()
+                ports[old_port] -= 1
+                if not ports[old_port]:
+                    del ports[old_port]
+                hosts[old_host] -= 1
+                if not hosts[old_host]:
+                    del hosts[old_host]
             return len(ports), len(hosts)
 
 

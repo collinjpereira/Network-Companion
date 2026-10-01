@@ -19,9 +19,11 @@ Environment:
 import asyncio
 import base64
 import ipaddress
+import json
 import os
 import secrets
 import tempfile
+from collections import deque
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, Form, UploadFile
@@ -113,37 +115,50 @@ async def _no_cache(request, call_next):
     return response
 
 # --- live packet fan-out ---------------------------------------------------
-# The Scapy sniffer runs in its own thread. We hand each packet to the asyncio
-# loop via call_soon_threadsafe, which drops it onto every connected client's
-# queue. Each WebSocket drains its own queue.
+# The Scapy sniffer runs in its own thread. Waking the asyncio loop and
+# sending one WebSocket message per packet falls over at a few thousand
+# packets/sec, so instead the sniffer thread just appends rows to a pending
+# deque (appends are thread-safe) and a loop task drains it on a short timer,
+# serialises each batch to JSON once, and drops that one string onto every
+# connected client's queue. Each WebSocket drains its own queue.
 
 _loop: Optional[asyncio.AbstractEventLoop] = None
 _subscribers: set[asyncio.Queue] = set()
+_pending: deque = deque()
+_FLUSH_INTERVAL = 0.1   # seconds between batches
+_MAX_BATCH = 5000       # rows per WebSocket message
 
 
 def _dispatch(row: dict):
     """Called from the sniffer thread for every captured packet."""
-    if _loop is None:
-        return
     row["channel"] = "capture"
-    _loop.call_soon_threadsafe(_fanout, row)
+    _pending.append(row)
 
 
 def _dispatch_nc(row: dict):
     """Called from the sniffer thread for packets classified as Network
     Companion's own traffic (see selftraffic.py / capture.classify_self_traffic)."""
-    if _loop is None:
-        return
     row["channel"] = "nc"
-    _loop.call_soon_threadsafe(_fanout, row)
+    _pending.append(row)
 
 
-def _fanout(row: dict):
+def _fanout(payload: str):
     for q in list(_subscribers):
         try:
-            q.put_nowait(row)
+            q.put_nowait(payload)
         except asyncio.QueueFull:
-            pass  # slow client; drop rather than block the loop
+            pass  # badly stalled client; drop rather than block the loop
+
+
+async def _flush_pending():
+    while True:
+        await asyncio.sleep(_FLUSH_INTERVAL)
+        while _pending:
+            batch = []
+            while _pending and len(batch) < _MAX_BATCH:
+                batch.append(_pending.popleft())
+            if _subscribers:
+                _fanout(json.dumps(batch, separators=(",", ":"), default=str))
 
 
 NC_PORT = int(os.environ.get("NC_PORT", "8787"))
@@ -156,6 +171,7 @@ mitm_engine = mitm_mod.MitmEngine()
 async def _capture_loop():
     global _loop
     _loop = asyncio.get_running_loop()
+    _loop.create_task(_flush_pending())
 
 
 @app.on_event("shutdown")
@@ -610,12 +626,12 @@ async def mitm_shape(req: ShapeRequest):
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
     await websocket.accept()
-    q: asyncio.Queue = asyncio.Queue(maxsize=5000)
+    q: asyncio.Queue = asyncio.Queue(maxsize=2000)  # batches, not packets
     _subscribers.add(q)
     try:
         while True:
-            row = await q.get()
-            await websocket.send_json(row)
+            payload = await q.get()
+            await websocket.send_text(payload)
     except WebSocketDisconnect:
         pass
     except Exception:

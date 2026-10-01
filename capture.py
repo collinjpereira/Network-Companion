@@ -259,7 +259,20 @@ def classify_self_traffic(pkt, service_port):
     return None
 
 
-def _info_string(pkt, proto) -> str:
+def _wire_len(pkt) -> int:
+    """Packet length without re-serialising it. len(pkt) on a Scapy packet
+    rebuilds its bytes, which is a real cost on every captured packet; a
+    dissected packet still holds the original bytes it was built from."""
+    original = getattr(pkt, "original", None)
+    if original:
+        return len(original)
+    return len(pkt)
+
+
+_NO_HINT = object()
+
+
+def _info_string(pkt, proto, hint=_NO_HINT) -> str:
     """A compact human-readable summary, similar to Wireshark's Info column."""
     if DNS is not None and pkt.haslayer(DNS):
         dns = pkt[DNS]
@@ -274,7 +287,8 @@ def _info_string(pkt, proto) -> str:
         tcp = pkt[TCP]
         flags = ",".join(_tcp_flag_list(tcp.flags)) or "none"
         base = f"{tcp.sport} \u2192 {tcp.dport} [{flags}] seq={tcp.seq} win={tcp.window}"
-        hint = _payload_hint(pkt)
+        if hint is _NO_HINT:
+            hint = _payload_hint(pkt)
         if hint:
             label, host, request_line = hint
             if request_line:
@@ -311,7 +325,8 @@ def summarize(pkt, number: int, base_time: float) -> dict:
     elif pkt.haslayer(ARP):
         transport = "arp"
     domain = None
-    if pkt.haslayer(TCP):
+    hint = None
+    if transport == "tcp":
         hint = _payload_hint(pkt)
         if hint:
             domain = hint[1]
@@ -330,8 +345,8 @@ def summarize(pkt, number: int, base_time: float) -> dict:
         "dst": dst,
         "proto": proto,
         "transport": transport,
-        "length": len(pkt),
-        "info": _info_string(pkt, proto),
+        "length": _wire_len(pkt),
+        "info": _info_string(pkt, proto, hint),
         "domain": domain,
         "sport": None,
         "dport": None,
