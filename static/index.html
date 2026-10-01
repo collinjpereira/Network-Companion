@@ -32,7 +32,11 @@
     <div class="capbar">
       <div class="field">
         <label>Interface</label>
-        <select id="iface"></select>
+        <div class="iface-row">
+          <select id="iface"></select>
+          <button class="btn btn-ghost icon-btn" id="iface-rescan" type="button"
+                  title="Rescan for network interfaces (picks up adapters, docks, VPNs or USB Wi-Fi added since the app started)">↻</button>
+        </div>
       </div>
       <div class="field grow">
         <label>Capture filter <span class="hint">BPF</span> <span class="filter-state" id="bpf-state"></span></label>
@@ -57,6 +61,15 @@
       <label class="toggle" title="Capture all frames on the segment, not only those addressed to this host">
         <input type="checkbox" id="promisc" checked />
         <span>Promiscuous</span>
+      </label>
+      <label class="buf-pick" title="Capture driver buffer. Absorbs bursts while packets are moved to the capture file; bigger means more headroom but reserves more RAM while capturing. 256 MB is plenty for most networks.">
+        <span>Buffer</span>
+        <select id="bufsize">
+          <option value="64">64 MB</option>
+          <option value="256" selected>256 MB</option>
+          <option value="512">512 MB</option>
+          <option value="1024">1 GB</option>
+        </select>
       </label>
       <button id="capture-btn" class="btn btn-primary">
         <span class="btn-dot"></span><span id="capture-label">Start capture</span>
@@ -88,6 +101,9 @@
     <div class="stats-strip">
       <div class="stat"><span class="stat-k">Packets</span><span class="stat-v" id="s-count">0</span></div>
       <div class="stat"><span class="stat-k">Rate</span><span class="stat-v" id="s-rate">0<em>/s</em></span></div>
+      <div class="stat stat-health" id="s-drop-wrap"><span class="stat-k">Dropped</span><span class="stat-v" id="s-drop">0</span></div>
+      <div class="stat" id="s-backlog-wrap" hidden title="Captured packets still being decoded. They're already safe in memory and in the capture file; the table is just catching up."><span class="stat-k">Decoding</span><span class="stat-v" id="s-backlog">0</span></div>
+      <button class="file-chip" id="s-file" hidden></button>
       <span class="source-tag" id="source-tag" hidden></span>
       <button class="nc-jump" id="nc-jump" hidden title="Traffic Network Companion generated about itself, kept out of this capture">
         NC traffic: <span id="nc-jump-count">0</span> ↗
@@ -120,6 +136,8 @@
         <button class="btn btn-ghost" id="open-pcap-btn" title="Open a .pcap / .pcapng file">Open PCAP</button>
         <input type="file" id="pcap-input" accept=".pcap,.pcapng,.cap" hidden />
         <button class="btn btn-ghost" id="export-btn">Export .pcap</button>
+        <button class="btn btn-ghost" id="detail-toggle" title="Show or hide the packet details pane">Details</button>
+        <button class="btn btn-ghost icon-btn" id="bar-custom-btn" title="Customize the toolbar: button position, spacing and widths">⚙</button>
         <button class="btn btn-ghost" id="export-all-btn" title="Also include NC Traffic (Network Companion's own traffic), normally kept out of the saved capture">Export all traffic .pcap</button>
       </div>
     </div>
@@ -161,6 +179,7 @@
       <div class="splitter" id="detail-splitter" title="Drag to resize"></div>
 
       <aside class="detail" id="detail">
+        <button class="detail-close" id="detail-close" type="button" title="Close the packet details (click a packet to open them again)">×</button>
         <div class="detail-empty" id="detail-empty">
           <p>Select a packet to inspect its layers and bytes.</p>
         </div>

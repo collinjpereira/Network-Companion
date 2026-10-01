@@ -6,9 +6,15 @@ const ET_FMT = new Intl.DateTimeFormat("en-US", {
   timeZone: "America/New_York", hour12: false,
   hour: "2-digit", minute: "2-digit", second: "2-digit",
 });
+/* Intl formatting is slow enough to show up when thousands of rows arrive at
+   once, and packets arrive in runs within the same second, so reuse the last
+   formatted second. */
+let etLastSec = null, etLastStr = "";
 function etTime(epoch) {
+  const sec = Math.floor(epoch);
+  if (sec !== etLastSec) { etLastSec = sec; etLastStr = ET_FMT.format(new Date(sec * 1000)); }
   const ms = String(Math.floor((epoch % 1) * 1000)).padStart(3, "0");
-  return ET_FMT.format(new Date(epoch * 1000)) + "." + ms;
+  return etLastStr + "." + ms;
 }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -70,6 +76,11 @@ function activateTab(name) {
       targetBody.appendChild(splitter);
       targetBody.appendChild(detail);
     }
+    // Scrolling has no effect while a tab is hidden, so catch the table up
+    // to whatever arrived in the meantime.
+    const table = name === "nc" ? ncTable : capTable;
+    if (table.following) table.scroll.scrollTop = table.scroll.scrollHeight;
+    table.render(false);
   }
   if (name === "intel") {
     if (map) setTimeout(() => map.invalidateSize(), 60);
@@ -90,7 +101,6 @@ const state = {
   flaggedOnly: false, resolveDns: false,
   displayPredicate: () => true,
   protoCounts: {}, rateWindow: [],
-  maxRows: 5000,
   ipNotes: {},
 };
 
@@ -110,12 +120,17 @@ const els = {
   status: $("#status"), captureBtn: $("#capture-btn"), captureLabel: $("#capture-label"),
 };
 
-async function loadInterfaces() {
+async function loadInterfaces(refresh) {
   try {
-    const r = await fetch("/api/interfaces");
+    const r = await fetch("/api/interfaces" + (refresh ? "?refresh=1" : ""));
     const data = await r.json();
-    const sel = $("#iface"); sel.innerHTML = "";
+    const sel = $("#iface");
+    const before = new Set([...sel.options].map(o => o.value));
+    const keep = sel.value;
+    sel.innerHTML = "";
     const craft = $("#craft-iface");
+    const keepCraft = craft ? craft.value : "";
+    if (craft) craft.innerHTML = '<option value="">auto</option>';
     (data.interfaces || []).forEach(i => {
       const label = i.name + (i.ip ? " · " + i.ip : "");
       const o = document.createElement("option");
@@ -124,6 +139,14 @@ async function loadInterfaces() {
       if (craft) { const o2 = document.createElement("option"); o2.value = i.name; o2.textContent = label; craft.appendChild(o2); }
     });
     if (!sel.options.length) { const o = document.createElement("option"); o.textContent = "no interfaces found"; sel.appendChild(o); }
+    if (keep && [...sel.options].some(o => o.value === keep)) sel.value = keep;
+    if (craft && keepCraft && [...craft.options].some(o => o.value === keepCraft)) craft.value = keepCraft;
+    if (refresh) {
+      const added = (data.interfaces || []).map(i => i.name).filter(n => !before.has(n));
+      const n = (data.interfaces || []).length;
+      flashNote(added.length ? `Found ${added.length} new interface${added.length > 1 ? "s" : ""}: ${added.join(", ")}`
+                             : `No new interfaces (${n} found)`);
+    }
     // WebKitGTK's native <select> widget can fail to repaint after being
     // populated while its panel is already visible on screen (the Capture
     // tab is active by default, unlike every other tab's panel, which
@@ -137,6 +160,12 @@ async function loadInterfaces() {
   } catch (e) {}
 }
 
+$("#iface-rescan").addEventListener("click", async e => {
+  const btn = e.currentTarget;
+  btn.disabled = true; btn.classList.add("spinning");
+  try { await loadInterfaces(true); } finally { btn.disabled = false; btn.classList.remove("spinning"); }
+});
+
 function setStatus(kind, text) {
   els.status.className = "status" + (kind ? " " + kind : "");
   els.status.querySelector(".status-text").textContent = text;
@@ -144,7 +173,7 @@ function setStatus(kind, text) {
 
 function resetBuffer() {
   state.packets = []; state.buffer = []; state.protoCounts = {}; state.rateWindow = [];
-  els.body.innerHTML = ""; els.empty.hidden = false;
+  capTable.setRows([]); els.empty.hidden = false;
   $("#detail-content").hidden = true; $("#detail-empty").hidden = false;
 }
 
@@ -156,10 +185,13 @@ async function toggleCapture() {
     els.captureLabel.textContent = "Start capture";
     setStatus("", "stopped");
   } else {
-    await fetch("/api/capture/clear", { method: "POST" });
+    if (!(await ensureSaved("Starting a new capture"))) return;
+    const cleared = await (await fetch("/api/capture/clear", { method: "POST" })).json();
     resetBuffer();
+    state.session = cleared.session;
     $("#source-tag").hidden = true;
-    const body = { iface: $("#iface").value || null, bpf: $("#bpf").value || null, promisc: $("#promisc").checked };
+    const body = { iface: $("#iface").value || null, bpf: $("#bpf").value || null, promisc: $("#promisc").checked,
+                   buffer_mb: +$("#bufsize").value };
     const r = await fetch("/api/capture/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const data = await r.json();
     if (!r.ok) { setStatus("error", "error"); els.empty.hidden = false; els.empty.querySelector("p").textContent = data.error || "Could not start capture."; return; }
@@ -370,7 +402,8 @@ function visible(pkt) {
 function makeRow(pkt, isNew) {
   const tr = document.createElement("tr");
   const lvl = pkt.threat ? pkt.threat.level : "none";
-  tr.className = "pkt-row" + (isNew ? " new-row" : "") + (lvl !== "none" ? " t-" + lvl : "");
+  tr.className = "pkt-row" + (isNew ? " new-row" : "") + (lvl !== "none" ? " t-" + lvl : "")
+    + (state.selected === pkt.number && state.selectedSource === "capture" ? " selected" : "");
   tr.dataset.n = pkt.number;
 
   const num = document.createElement("td"); num.className = "c-num"; num.textContent = pkt.number;
@@ -384,7 +417,6 @@ function makeRow(pkt, isNew) {
   if (lvl !== "none") { const d = document.createElement("span"); d.className = "tdot t-" + lvl; info.appendChild(d); }
 
   tr.append(num, time, src, dst, proto, len, info);
-  tr.addEventListener("click", () => selectPacket(pkt.number, tr));
   const tagColor = rowTagColor(pkt);
   if (tagColor) {
     const mark = document.createElement("span");
@@ -394,28 +426,134 @@ function makeRow(pkt, isNew) {
   return tr;
 }
 
+/* ---------- virtualised packet table ----------
+   A plain <table> holding thousands of rows gets re-laid out in full every
+   time rows are added, which made the UI lag from a couple of thousand
+   packets onward. Instead, only the rows in (or near) the viewport exist in
+   the DOM, with two spacer rows standing in for everything above and below,
+   so the cost of an update no longer grows with the size of the capture and
+   every packet stays scrollable (no more 5000-row cap). Rows are a fixed
+   height (nowrap cells), measured from the first real row. */
+const VT_OVERSCAN = 20;  // extra rows rendered above/below the viewport
+
+class VirtualTable {
+  constructor(scrollEl, tbody, makeRowFn, cols) {
+    this.scroll = scrollEl; this.body = tbody; this.makeRow = makeRowFn;
+    this.rows = []; this.rowH = 25; this.measured = false;
+    this.start = 0; this.end = 0;  // rendered range [start, end)
+    // Whether new rows should be followed. Tracked from scroll events rather
+    // than recomputed on append, since appending grows the bottom spacer
+    // without the user having scrolled away.
+    this.following = true;
+    this.top = this._spacer(cols); this.bottom = this._spacer(cols);
+    this.body.replaceChildren(this.top, this.bottom);
+    this.scroll.addEventListener("scroll", () => { this.following = this.atBottom(); this._schedule(); }, { passive: true });
+    // Also fires when a hidden tab is shown again; scrolling can't take
+    // effect while hidden, so re-pin to the newest rows then.
+    new ResizeObserver(() => {
+      if (this.following) this.scroll.scrollTop = this.scroll.scrollHeight;
+      this._schedule();
+    }).observe(this.scroll);
+  }
+  _spacer(cols) {
+    const tr = document.createElement("tr"); tr.className = "vt-spacer";
+    const td = document.createElement("td"); td.colSpan = cols;
+    tr.appendChild(td); return tr;
+  }
+  _schedule() {
+    if (this._raf) return;
+    this._raf = requestAnimationFrame(() => { this._raf = 0; this.render(false); });
+  }
+  atBottom() { return this.scroll.scrollHeight - this.scroll.scrollTop - this.scroll.clientHeight < 60; }
+  /* Replace every row (filter change, PCAP load, clear). */
+  setRows(rows) {
+    this.rows = rows;
+    if (!rows.length) this.following = true;
+    this.start = this.end = 0;
+    this.body.replaceChildren(this.top, this.bottom);
+    this.render(false);
+  }
+  /* Add new rows at the end, following them if the view was at the bottom. */
+  append(rows, flash) {
+    if (!rows.length) return;
+    for (const r of rows) this.rows.push(r);
+    this._sizeSpacers();
+    if (this.following) this.scroll.scrollTop = this.scroll.scrollHeight;
+    this.render(flash);
+  }
+  /* Rebuild the rendered rows in place (tag colours, resolved names). */
+  refresh() { const keep = this.rows; this.setRows(keep); }
+  _sizeSpacers() {
+    this.top.firstChild.style.height = (this.start * this.rowH) + "px";
+    this.bottom.firstChild.style.height = (Math.max(0, this.rows.length - this.end) * this.rowH) + "px";
+  }
+  render(flash) {
+    const n = this.rows.length;
+    const view = this.scroll.clientHeight || 600;
+    let s = Math.max(0, Math.floor(this.scroll.scrollTop / this.rowH) - VT_OVERSCAN);
+    let e = Math.min(n, Math.ceil((this.scroll.scrollTop + view) / this.rowH) + VT_OVERSCAN);
+    if (s > e) s = e;
+    if (s >= this.end || e <= this.start) {
+      // No overlap with what's rendered: rebuild the window.
+      while (this.top.nextSibling !== this.bottom) this.top.nextSibling.remove();
+      const frag = document.createDocumentFragment();
+      for (let i = s; i < e; i++) frag.appendChild(this.makeRow(this.rows[i], flash));
+      this.bottom.before(frag);
+    } else {
+      // Overlap: trim / extend each end, keeping existing row elements.
+      for (let i = this.start; i < s; i++) this.top.nextSibling.remove();
+      for (let i = e; i < this.end; i++) this.bottom.previousSibling.remove();
+      if (s < this.start) {
+        const frag = document.createDocumentFragment();
+        for (let i = s; i < this.start; i++) frag.appendChild(this.makeRow(this.rows[i], false));
+        this.top.after(frag);
+      }
+      if (e > this.end) {
+        const frag = document.createDocumentFragment();
+        for (let i = Math.max(this.end, s); i < e; i++) frag.appendChild(this.makeRow(this.rows[i], flash));
+        this.bottom.before(frag);
+      }
+    }
+    this.start = s; this.end = e;
+    this._sizeSpacers();
+    if (!this.measured && e > s) {
+      const h = this.top.nextSibling.getBoundingClientRect().height;
+      if (h > 0) { this.measured = true; if (Math.abs(h - this.rowH) > 0.1) {
+        this.rowH = h; this._sizeSpacers();
+        if (this.following) this.scroll.scrollTop = this.scroll.scrollHeight;
+        this._schedule();
+      } }
+    }
+  }
+}
+
+/* Above this many new rows in one flush, skip the "new row" flash: animating
+   lots of rows at once costs more than it's worth and nobody can see
+   individual rows at that rate anyway. */
+const FLASH_LIMIT = 200;
+
+const capTable = new VirtualTable(els.scroll, els.body, makeRow, 7);
+
 function flushBuffer() {
   if (!state.buffer.length || state.paused) return;
-  const atBottom = els.scroll.scrollHeight - els.scroll.scrollTop - els.scroll.clientHeight < 60;
-  const frag = document.createDocumentFragment();
-  let added = 0;
-  for (const pkt of state.buffer) if (visible(pkt)) { frag.appendChild(makeRow(pkt, true)); added++; }
+  const matched = [];
+  for (const pkt of state.buffer) if (visible(pkt)) matched.push(pkt);
   state.buffer = [];
-  if (added) {
-    els.empty.hidden = true;
-    els.body.appendChild(frag);
-    while (els.body.children.length > state.maxRows) els.body.removeChild(els.body.firstChild);
-    if (atBottom) els.scroll.scrollTop = els.scroll.scrollHeight;
-  }
+  if (!matched.length) return;
+  els.empty.hidden = true;
+  capTable.append(matched, matched.length <= FLASH_LIMIT);
 }
 setInterval(flushBuffer, 200);
 
+/* One click handler for the whole table instead of one per row. */
+els.body.addEventListener("click", e => {
+  const tr = e.target.closest(".pkt-row");
+  if (tr) selectPacket(+tr.dataset.n, tr);
+});
+
 function rerenderTable() {
-  els.body.innerHTML = "";
-  const frag = document.createDocumentFragment();
   const matched = state.packets.filter(visible);
-  matched.slice(-state.maxRows).forEach(p => frag.appendChild(makeRow(p, false)));
-  els.body.appendChild(frag);
+  capTable.setRows(matched);
   els.empty.hidden = matched.length > 0;
 }
 
@@ -452,8 +590,10 @@ setInterval(resolveNames, 1200);
 function updateStats() {
   els.count.textContent = state.packets.length.toLocaleString();
   const now = Date.now();
-  state.rateWindow = state.rateWindow.filter(t => now - t < 2000);
-  els.rate.innerHTML = Math.round(state.rateWindow.length / 2) + "<em>/s</em>";
+  // rateWindow holds [timestamp, packetCount] per received batch.
+  state.rateWindow = state.rateWindow.filter(b => now - b[0] < 2000);
+  const recent = state.rateWindow.reduce((a, b) => a + b[1], 0);
+  els.rate.innerHTML = Math.round(recent / 2) + "<em>/s</em>";
   const total = Object.values(state.protoCounts).reduce((a, b) => a + b, 0) || 1;
   els.protoBar.innerHTML = "";
   Object.entries(state.protoCounts).sort((a, b) => b[1] - a[1]).forEach(([p, c]) => {
@@ -491,6 +631,7 @@ function layerFields(detail, name) {
 }
 
 function renderDetail(n, d, source) {
+  setDetailOpen(true);
   source = source || "capture";
   $("#detail-empty").hidden = true;
   $("#detail-content").hidden = false;
@@ -632,27 +773,156 @@ document.addEventListener("click", e => {
   });
 });
 
+/* ---------- packet intake ----------
+   Rows arrive over the WebSocket in batches. Each row carries its capture
+   session and its packet number (which is also its index in state.packets),
+   so if a batch ever starts past where the table is, e.g. after the socket
+   dropped and reconnected, the missing range is fetched from the server
+   before carrying on. Rows are never skipped and never shown out of order. */
+state.session = null;
+const intakeQueue = [];
+let intakeBusy = false;
+
+function ingestCaptureRow(pkt) {
+  // Unbounded on purpose: nothing gets dropped from a running capture.
+  state.packets.push(pkt);
+  state.buffer.push(pkt);
+  state.protoCounts[pkt.proto] = (state.protoCounts[pkt.proto] || 0) + 1;
+  noteFlag(pkt.src); noteFlag(pkt.dst);
+  if (state.resolveDns) { noteName(pkt.src); noteName(pkt.dst); }
+}
+
+function adoptSession(session) {
+  if (state.session !== null && state.session !== session) resetBuffer();
+  state.session = session;
+}
+
+/* Fetch rows [state.packets.length, upTo) from the server. */
+async function fillGap(upTo) {
+  while (state.packets.length < upTo) {
+    let d;
+    try {
+      const r = await fetch(`/api/capture/rows?start=${state.packets.length}&end=${upTo}`);
+      d = await r.json();
+    } catch (e) { return; }
+    if (d.session !== state.session || !d.rows.length) return;
+    for (const pkt of d.rows) if (pkt.number === state.packets.length) ingestCaptureRow(pkt);
+  }
+}
+
+/* Catch up with whatever the server has (page load, socket reconnect). */
+async function syncWithServer() {
+  let st;
+  try { st = await (await fetch("/api/capture/status")).json(); } catch (e) { return; }
+  if (state.session === null || st.session > state.session) adoptSession(st.session);
+  if (st.session === state.session && st.count > state.packets.length) await fillGap(st.count);
+}
+
+async function pumpIntake() {
+  if (intakeBusy) return;
+  intakeBusy = true;
+  try {
+    while (intakeQueue.length) {
+      const item = intakeQueue.shift();
+      if (item === "sync") { await syncWithServer(); continue; }
+      let captured = 0;
+      for (const pkt of item) {
+        if (pkt.channel === "nc") {
+          ncState.packets.push(pkt);
+          ncState.buffer.push(pkt);
+          noteFlag(pkt.src); noteFlag(pkt.dst);
+          continue;
+        }
+        if (pkt.session !== state.session) {
+          if (state.session === null || pkt.session > state.session) adoptSession(pkt.session);
+          else continue;  // left over from a capture that's since been cleared
+        }
+        if (pkt.number < state.packets.length) continue;  // already have it
+        if (pkt.number > state.packets.length) await fillGap(pkt.number);
+        if (pkt.number !== state.packets.length) continue;
+        ingestCaptureRow(pkt);
+        captured++;
+      }
+      if (captured) state.rateWindow.push([Date.now(), captured]);
+    }
+  } finally {
+    intakeBusy = false;
+  }
+}
+
 function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => { intakeQueue.push("sync"); pumpIntake(); };
+  // The server sends packets in batches (a JSON array per message).
   ws.onmessage = ev => {
-    const pkt = JSON.parse(ev.data);
-    if (pkt.channel === "nc") {
-      ncState.packets.push(pkt);
-      ncState.buffer.push(pkt);
-      noteFlag(pkt.src); noteFlag(pkt.dst);
-      return;
-    }
-    // Unbounded on purpose: nothing gets dropped from a running capture.
-    state.packets.push(pkt);
-    state.buffer.push(pkt);
-    state.protoCounts[pkt.proto] = (state.protoCounts[pkt.proto] || 0) + 1;
-    state.rateWindow.push(Date.now());
-    noteFlag(pkt.src); noteFlag(pkt.dst);
-    if (state.resolveDns) { noteName(pkt.src); noteName(pkt.dst); }
+    const data = JSON.parse(ev.data);
+    intakeQueue.push(Array.isArray(data) ? data : [data]);
+    pumpIntake();
   };
   ws.onclose = () => setTimeout(connectWS, 1500);
 }
+
+/* ---------- capture health: driver drops, decode backlog, capture file ---------- */
+const healthEls = {
+  drop: $("#s-drop"), dropWrap: $("#s-drop-wrap"),
+  backlog: $("#s-backlog"), backlogWrap: $("#s-backlog-wrap"),
+  file: $("#s-file"),
+};
+
+function humanSize(n) {
+  if (n < 1024 * 1024) return Math.max(1, Math.round(n / 1024)) + " KB";
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
+  return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
+}
+
+async function pollCaptureHealth() {
+  let st;
+  try { st = await (await fetch("/api/capture/status")).json(); } catch (e) { return; }
+  const drv = st.driver;
+  if (drv) {
+    const dropped = (drv.dropped || 0) + (drv.ifdropped || 0);
+    healthEls.drop.textContent = dropped.toLocaleString();
+    healthEls.dropWrap.classList.toggle("bad", dropped > 0);
+    healthEls.dropWrap.classList.toggle("good", dropped === 0);
+    healthEls.dropWrap.title = `Packets the capture driver had to drop because its buffer was full. ` +
+      `Should stay at 0.\nDriver received: ${(drv.received || 0).toLocaleString()} · ` +
+      `dropped: ${(drv.dropped || 0).toLocaleString()} · interface dropped: ${(drv.ifdropped || 0).toLocaleString()}`;
+  } else {
+    healthEls.drop.textContent = "—";
+    healthEls.dropWrap.classList.remove("bad", "good");
+    healthEls.dropWrap.title = "Packets the capture driver had to drop. Starts counting when you start a capture.";
+  }
+  healthEls.backlogWrap.hidden = !st.backlog;
+  if (st.buffer_mb) healthEls.dropWrap.title += `\nDriver buffer for this capture: ${st.buffer_mb} MB`;
+  healthEls.backlog.textContent = (st.backlog || 0).toLocaleString();
+  const f = st.file;
+  healthEls.file.hidden = !f;
+  if (f) {
+    healthEls.file.textContent = (f.error ? "Capture file error" : "Capture file") + " · " + humanSize(f.bytes);
+    healthEls.file.classList.toggle("bad", !!f.error);
+    healthEls.file.title = (f.error ? "Writing the capture file failed: " + f.error + "\n" : "") +
+      "Every packet (including NC traffic) is written to this temporary file as it's captured, " +
+      "like Wireshark does, so nothing is lost if the app is slow or crashes.\n" +
+      "Use Export .pcap to save it. You'll be asked before anything unsaved is discarded.\n" +
+      f.path + "\nClick to open the folder.";
+  }
+  if (st.error && state.running) setStatus("error", "capture error: " + st.error);
+  if (state.running && !st.running) {
+    // The reader stopped on its own (adapter unplugged, driver error).
+    state.running = false;
+    els.captureBtn.classList.remove("recording");
+    els.captureLabel.textContent = "Start capture";
+    if (!st.error) setStatus("", "stopped");
+  }
+}
+setInterval(pollCaptureHealth, 1000);
+
+const BUF_KEY = "networkcompanion_buffer_mb";
+try { const saved = localStorage.getItem(BUF_KEY); if (saved && $(`#bufsize option[value="${saved}"]`)) $("#bufsize").value = saved; } catch (e) {}
+$("#bufsize").addEventListener("change", e => { try { localStorage.setItem(BUF_KEY, e.target.value); } catch (err) {} });
+
+healthEls.file.addEventListener("click", () => fetch("/api/capture/open-folder", { method: "POST" }));
 
 /* ---------- capture controls ---------- */
 els.captureBtn.addEventListener("click", toggleCapture);
@@ -673,25 +943,282 @@ $("#resolve-btn").addEventListener("click", e => {
   rerenderTable();
 });
 $("#clear-btn").addEventListener("click", async () => {
-  await fetch("/api/capture/clear", { method: "POST" });
-  resetBuffer(); $("#source-tag").hidden = true;
+  if (!(await ensureSaved("Clearing"))) return;
+  const cleared = await (await fetch("/api/capture/clear", { method: "POST" })).json();
+  resetBuffer(); state.session = cleared.session; $("#source-tag").hidden = true;
 });
-$("#export-btn").addEventListener("click", async () => {
-  const r = await fetch("/api/export");
-  if (!r.ok) { const d = await r.json(); alert(d.error); return; }
+/* ---------- saving captures ----------
+   The desktop window can't do browser downloads, so in the desktop app
+   Export opens a real Save As dialog (pywebview) and the server writes the
+   file straight to the chosen path. In a normal browser it downloads. */
+function hasDesktopApi(name) {
+  return !!(window.pywebview && window.pywebview.api && window.pywebview.api[name]);
+}
+
+function stamp() {
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}`;
+}
+
+/* Returns true once the capture is saved, false if cancelled or failed. */
+async function saveCapture(includeNc) {
+  const name = `network_companion_${includeNc ? "all_traffic_" : ""}${stamp()}.pcap`;
+  if (hasDesktopApi("save_dialog")) {
+    const path = await window.pywebview.api.save_dialog(name);
+    if (!path) return false;
+    const r = await fetch("/api/capture/save", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, include_nc: !!includeNc }) });
+    const d = await r.json();
+    if (!r.ok) { alert(d.error || "Could not save the capture."); return false; }
+    flashNote(`Saved ${d.saved.toLocaleString()} packets to ${d.path}`);
+    return true;
+  }
+  const r = await fetch(includeNc ? "/api/export/all" : "/api/export");
+  if (!r.ok) { const d = await r.json(); alert(d.error); return false; }
   const blob = await r.blob();
   const url = URL.createObjectURL(blob);
-  const a = document.createElement("a"); a.href = url; a.download = "network_companion_capture.pcap"; a.click();
-  URL.revokeObjectURL(url);
-});
-$("#export-all-btn").addEventListener("click", async () => {
-  const r = await fetch("/api/export/all");
-  if (!r.ok) { const d = await r.json(); alert(d.error); return; }
-  const blob = await r.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a"); a.href = url; a.download = "network_companion_capture_all_traffic.pcap"; a.click();
-  URL.revokeObjectURL(url);
-});
+  const a = document.createElement("a"); a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  return true;
+}
+
+function flashNote(text) {
+  let el = $("#nc-note");
+  if (!el) { el = document.createElement("div"); el.id = "nc-note"; el.className = "nc-note"; document.body.appendChild(el); }
+  el.textContent = text; el.classList.add("show");
+  clearTimeout(flashNote._t); flashNote._t = setTimeout(() => el.classList.remove("show"), 5000);
+}
+
+/* Small three-way dialog. Resolves to the clicked button's value. */
+function ncChoice(title, message, buttons) {
+  return new Promise(resolve => {
+    const back = document.createElement("div"); back.className = "nc-modal-back";
+    const box = document.createElement("div"); box.className = "nc-modal";
+    const h = document.createElement("h3"); h.textContent = title;
+    const p = document.createElement("p"); p.textContent = message;
+    const row = document.createElement("div"); row.className = "nc-modal-actions";
+    buttons.forEach(b => {
+      const btn = document.createElement("button");
+      btn.className = "btn " + (b.primary ? "btn-primary" : "btn-ghost") + (b.danger ? " btn-danger" : "");
+      btn.textContent = b.label;
+      btn.addEventListener("click", () => { back.remove(); resolve(b.value); });
+      row.appendChild(btn);
+    });
+    box.append(h, p, row); back.appendChild(box); document.body.appendChild(back);
+    row.querySelector(".btn-primary")?.focus();
+  });
+}
+
+/* Before anything that throws the current capture away: if it has unsaved
+   packets, offer to save them first. Resolves true to go ahead. */
+async function ensureSaved(what) {
+  let st;
+  try { st = await (await fetch("/api/capture/status")).json(); } catch (e) { return true; }
+  if (!st.unsaved) return true;
+  const n = (st.count || 0).toLocaleString();
+  const choice = await ncChoice("Save this capture first?",
+    `You have ${n} packets that haven't been saved. ${what} will discard them.`,
+    [{ label: "Save…", value: "save", primary: true },
+     { label: "Don't save", value: "discard", danger: true },
+     { label: "Cancel", value: "cancel" }]);
+  if (choice === "cancel") return false;
+  if (choice === "save") return await saveCapture(false);
+  await fetch("/api/capture/discard", { method: "POST" });
+  return true;
+}
+
+/* Called by the desktop app when the window is closed with unsaved packets. */
+async function ncAskBeforeClose() {
+  const st = await (await fetch("/api/capture/status")).json();
+  const n = (st.count || 0).toLocaleString();
+  const choice = await ncChoice("Save before closing?",
+    `You have ${n} packets that haven't been saved.`,
+    [{ label: "Save…", value: "save", primary: true },
+     { label: "Don't save", value: "discard", danger: true },
+     { label: "Cancel", value: "cancel" }]);
+  if (choice === "cancel") return;
+  if (choice === "save" && !(await saveCapture(false))) return;
+  if (choice === "discard") await fetch("/api/capture/discard", { method: "POST" });
+  window.pywebview.api.close_app();
+}
+
+/* Captures left unsaved by a crash are moved to Documents at startup;
+   say so once. */
+(async function showRecovered() {
+  let st;
+  try { st = await (await fetch("/api/capture/status")).json(); } catch (e) { return; }
+  if (!st.recovered || !st.recovered.length) return;
+  const choice = await ncChoice("Recovered unsaved captures",
+    `Found ${st.recovered.length} capture file(s) from a session that ended without saving. ` +
+    `They've been moved to Documents\\Network Companion Recovered so nothing was lost.`,
+    [{ label: "Open folder", value: "open", primary: true }, { label: "OK", value: "ok" }]);
+  if (choice === "open") fetch("/api/capture/open-folder?which=recovered", { method: "POST" });
+})();
+
+$("#export-btn").addEventListener("click", () => saveCapture(false));
+$("#export-all-btn").addEventListener("click", () => saveCapture(true));
+
+/* ---------- packet detail pane: close / reopen ----------
+   The × hides the pane so the table gets the full width; selecting a
+   packet (or the Details button) brings it back. */
+function setDetailOpen(open) {
+  document.body.classList.toggle("detail-closed", !open);
+  const t = $("#detail-toggle");
+  if (t) t.classList.toggle("active", open);
+}
+$("#detail-close").addEventListener("click", () => setDetailOpen(false));
+$("#detail-toggle").addEventListener("click", () => setDetailOpen(document.body.classList.contains("detail-closed")));
+setDetailOpen(true);
+
+
+/* ---------- customize toolbar ----------
+   Button position, spacing and widths, so the bars can be set up to suit
+   anything from a laptop to an ultrawide. Stored per machine. */
+(function customizeToolbar() {
+  const KEY = "networkcompanion_bar_style";
+  const DEFAULTS = { align: "right", gap: 8, filterW: 230, protoW: 460, bpfW: 480 };
+  let cfg = { ...DEFAULTS };
+  try { cfg = { ...DEFAULTS, ...JSON.parse(localStorage.getItem(KEY) || "{}") }; } catch (e) {}
+
+  function apply() {
+    const root = document.documentElement.style;
+    root.setProperty("--bar-gap", cfg.gap + "px");
+    root.setProperty("--filter-w", cfg.filterW + "px");
+    root.setProperty("--proto-w", cfg.protoW + "px");
+    root.setProperty("--bpf-w", cfg.bpfW + "px");
+    document.body.classList.remove("bar-left", "bar-center", "bar-right");
+    document.body.classList.add("bar-" + cfg.align);
+    document.body.classList.toggle("proto-hidden", cfg.protoW === 0);
+  }
+  function save() { try { localStorage.setItem(KEY, JSON.stringify(cfg)); } catch (e) {} }
+  apply();
+
+  const panel = document.createElement("div");
+  panel.className = "bar-custom"; panel.hidden = true;
+  panel.innerHTML = `
+    <div class="bc-head">Customize toolbar <button class="bc-x" type="button" title="Close">×</button></div>
+    <div class="bc-row"><span>Buttons</span>
+      <div class="bc-seg" data-k="align">
+        <button type="button" data-v="left">Left</button><button type="button" data-v="center">Center</button><button type="button" data-v="right">Right</button>
+      </div></div>
+    <div class="bc-row"><span>Spacing</span>
+      <div class="bc-seg" data-k="gap">
+        <button type="button" data-v="4">Compact</button><button type="button" data-v="8">Normal</button><button type="button" data-v="16">Roomy</button>
+      </div></div>
+    <label class="bc-row"><span>Display filter width</span><input type="range" data-k="filterW" min="160" max="900" step="10"><em></em></label>
+    <label class="bc-row"><span>Protocol bar width</span><input type="range" data-k="protoW" min="0" max="1600" step="20"><em></em></label>
+    <label class="bc-row"><span>Capture filter width</span><input type="range" data-k="bpfW" min="200" max="1400" step="20"><em></em></label>
+    <p class="bc-hint">Drag any button on the bar to move it.</p>
+    <div class="bc-foot"><button class="btn btn-ghost" type="button" id="bc-reset">Reset layout</button></div>`;
+  document.body.appendChild(panel);
+
+  function sync() {
+    panel.querySelectorAll(".bc-seg").forEach(seg => {
+      seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", String(cfg[seg.dataset.k]) === b.dataset.v));
+    });
+    panel.querySelectorAll("input[type=range]").forEach(r => {
+      r.value = cfg[r.dataset.k];
+      r.nextElementSibling.textContent = +r.value === 0 ? "hidden" : r.value + "px";
+    });
+  }
+  panel.querySelectorAll(".bc-seg button").forEach(b => b.addEventListener("click", () => {
+    const k = b.parentElement.dataset.k;
+    cfg[k] = k === "align" ? b.dataset.v : +b.dataset.v;
+    apply(); save(); sync();
+  }));
+  panel.querySelectorAll("input[type=range]").forEach(r => r.addEventListener("input", () => {
+    cfg[r.dataset.k] = +r.value; apply(); save(); sync();
+  }));
+  panel.querySelector(".bc-x").addEventListener("click", () => { panel.hidden = true; });
+  panel.querySelector("#bc-reset").addEventListener("click", () => {
+    cfg = { ...DEFAULTS }; apply(); save(); sync();
+    try { localStorage.removeItem("networkcompanion_bar_order"); } catch (e) {}
+    location.reload();  // also restores the default button order
+  });
+
+  window.openBarCustomizer = function () {
+    sync();
+    panel.hidden = false;
+    const btn = $("#bar-custom-btn").getBoundingClientRect();
+    panel.style.top = Math.round(btn.bottom + 6) + "px";
+    panel.style.left = Math.round(Math.max(8, Math.min(btn.right - panel.offsetWidth, innerWidth - panel.offsetWidth - 8))) + "px";
+  };
+  $("#bar-custom-btn").addEventListener("click", e => {
+    e.stopPropagation();
+    if (panel.hidden) openBarCustomizer(); else panel.hidden = true;
+  });
+  document.addEventListener("mousedown", e => {
+    if (!panel.hidden && !panel.contains(e.target) && e.target.id !== "bar-custom-btn") panel.hidden = true;
+  });
+})();
+
+/* ---------- rearrangeable toolbar ----------
+   Drag any button (or the filter box by its edge) to move it. The order is
+   remembered; right-click the bar to reset it. */
+(function barLayout() {
+  const bar = $(".strip-actions");
+  if (!bar) return;
+  const KEY = "networkcompanion_bar_order";
+  const keyOf = el => el.id || (el.classList.contains("filter-wrap") ? "filter-wrap" : "");
+  const items = () => [...bar.children].filter(el => keyOf(el) && el.id !== "pcap-input");
+  const byKey = k => k === "filter-wrap" ? bar.querySelector(":scope > .filter-wrap") : document.getElementById(k);
+  const defaultOrder = items().map(keyOf);
+
+  function apply(order) {
+    order.forEach(k => { const el = byKey(k); if (el && el.parentElement === bar) bar.appendChild(el); });
+    // Anything not in a saved order (e.g. a button added in an update) goes last.
+  }
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(items().map(keyOf))); } catch (e) {}
+  }
+  try {
+    const saved = JSON.parse(localStorage.getItem(KEY) || "null");
+    if (Array.isArray(saved)) apply(saved);
+  } catch (e) {}
+
+  let dragged = null;
+  items().forEach(el => {
+    el.draggable = true;
+    el.classList.add("bar-item");
+    // Let text inside the filter box be selected normally instead of
+    // starting a drag of the whole box.
+    el.querySelectorAll("input").forEach(inp => {
+      inp.addEventListener("mousedown", () => { el.draggable = false; });
+      inp.addEventListener("mouseup", () => { el.draggable = true; });
+      inp.addEventListener("blur", () => { el.draggable = true; });
+    });
+    el.addEventListener("dragstart", e => {
+      dragged = el; el.classList.add("dragging");
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", keyOf(el));
+    });
+    el.addEventListener("dragend", () => {
+      el.classList.remove("dragging"); dragged = null; save();
+    });
+  });
+  bar.addEventListener("dragover", e => {
+    if (!dragged) return;
+    e.preventDefault();
+    const target = e.target.closest(".bar-item");
+    if (!target || target === dragged || target.parentElement !== bar) return;
+    const r = target.getBoundingClientRect();
+    const after = e.clientX > r.left + r.width / 2;
+    bar.insertBefore(dragged, after ? target.nextSibling : target);
+  });
+  bar.addEventListener("drop", e => { if (dragged) e.preventDefault(); });
+  bar.addEventListener("contextmenu", e => {
+    if (e.target.closest("input")) return;
+    e.preventDefault();
+    openCtxMenu(e.clientX, e.clientY, [
+      { label: "Customize toolbar…", action: () => openBarCustomizer() },
+      "separator",
+      { label: "Reset toolbar layout", action: () => {
+        try { localStorage.removeItem(KEY); } catch (err) {}
+        apply(defaultOrder);
+      } },
+    ]);
+  });
+})();
 $("#display-filter").addEventListener("input", e => updateDisplayFilter(e.target.value));
 
 /* capture-filter (BPF) validation */
@@ -711,7 +1238,9 @@ async function validateBpf() {
 }
 
 /* Open PCAP */
-$("#open-pcap-btn").addEventListener("click", () => $("#pcap-input").click());
+$("#open-pcap-btn").addEventListener("click", async () => {
+  if (await ensureSaved("Opening a file")) $("#pcap-input").click();
+});
 $("#pcap-input").addEventListener("change", async e => {
   const file = e.target.files[0]; if (!file) return;
   const btn = $("#open-pcap-btn"); btn.disabled = true; btn.textContent = "Loading…";
@@ -724,6 +1253,7 @@ $("#pcap-input").addEventListener("change", async e => {
       state.running = false; els.captureBtn.classList.remove("recording");
       els.captureLabel.textContent = "Start capture"; setStatus("", "stopped");
     }
+    state.session = d.session;
     state.packets = d.packets; state.buffer = []; state.protoCounts = {}; state.rateWindow = [];
     state.packets.forEach(p => {
       state.protoCounts[p.proto] = (state.protoCounts[p.proto] || 0) + 1;
@@ -818,7 +1348,8 @@ applyNcVisibility();
 
 function makeNcRow(pkt) {
   const tr = document.createElement("tr");
-  tr.className = "pkt-row"; tr.dataset.n = pkt.number;
+  tr.className = "pkt-row" + (state.selected === pkt.number && state.selectedSource === "nc" ? " selected" : "");
+  tr.dataset.n = pkt.number;
   const num = document.createElement("td"); num.className = "c-num"; num.textContent = pkt.number;
   const time = document.createElement("td"); time.className = "c-time"; time.textContent = etTime(pkt.epoch);
   const src = addrCell(pkt.src);
@@ -828,34 +1359,35 @@ function makeNcRow(pkt) {
   const info = document.createElement("td"); info.className = "c-info"; info.title = pkt.reason || "";
   info.textContent = pkt.reason || "";
   tr.append(num, time, src, dst, proto, len, info);
-  tr.addEventListener("click", () => selectPacket(pkt.number, tr, "nc"));
   return tr;
 }
 
+const ncTable = new VirtualTable(ncEls.body.closest(".rows-scroll"), ncEls.body, makeNcRow, 7);
+
 function flushNcBuffer() {
   if (!ncState.buffer.length) return;
-  const frag = document.createDocumentFragment();
-  for (const pkt of ncState.buffer) frag.appendChild(makeNcRow(pkt));
+  const rows = ncState.buffer;
   ncState.buffer = [];
   ncEls.empty.hidden = true;
-  ncEls.body.appendChild(frag);
-  while (ncEls.body.children.length > state.maxRows) ncEls.body.removeChild(ncEls.body.firstChild);
+  ncTable.append(rows, false);
   updateNcBadges();
 }
 setInterval(flushNcBuffer, 200);
 
+ncEls.body.addEventListener("click", e => {
+  const tr = e.target.closest(".pkt-row");
+  if (tr) selectPacket(+tr.dataset.n, tr, "nc");
+});
+
 function rerenderNcTable() {
-  ncEls.body.innerHTML = "";
-  const frag = document.createDocumentFragment();
-  ncState.packets.slice(-state.maxRows).forEach(p => frag.appendChild(makeNcRow(p)));
-  ncEls.body.appendChild(frag);
+  ncTable.setRows(ncState.packets.slice());
   ncEls.empty.hidden = ncState.packets.length > 0;
 }
 
 $("#nc-clear-btn").addEventListener("click", async () => {
   await fetch("/api/nc/clear", { method: "POST" });
   ncState.packets = []; ncState.buffer = [];
-  ncEls.body.innerHTML = ""; ncEls.empty.hidden = false;
+  ncTable.setRows([]); ncEls.empty.hidden = false;
   updateNcBadges();
 });
 $("#nc-jump").addEventListener("click", () => activateTab("nc"));
@@ -863,7 +1395,7 @@ $("#nc-jump").addEventListener("click", () => activateTab("nc"));
 async function deleteNcPacket(n, tr) {
   try { await fetch("/api/nc/packet/" + n, { method: "DELETE" }); } catch (e) {}
   ncState.packets = ncState.packets.filter(p => p.number !== n);
-  if (tr) tr.remove();
+  rerenderNcTable();
   updateNcBadges();
 }
 
@@ -1358,13 +1890,24 @@ function renderThreat(abuse, ip, isPriv) {
     kv("Usage type", abuse.usageType || "—") + cats + link;
 }
 
+/* Map background. CARTO's basemaps used to be keyless but now return
+   "API key required" tiles, so use Esri's dark gray canvas (no key needed;
+   attribution required, hence the attribution control) plus its label layer. */
+const ESRI_TILES = "https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/";
+function addBaseTiles(m) {
+  m.attributionControl.setPrefix(false);
+  L.tileLayer(ESRI_TILES + "World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+    { maxZoom: 16, attribution: "Tiles &copy; Esri &mdash; Esri, HERE, Garmin, OpenStreetMap contributors" }).addTo(m);
+  L.tileLayer(ESRI_TILES + "World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}", { maxZoom: 16 }).addTo(m);
+}
+
 function renderMap(geo) {
   const card = $(".map-card");
   if (typeof L === "undefined" || !geo.ok || geo.lat == null) { card.style.display = "none"; return; }
   card.style.display = "block";
   if (!map) {
-    map = L.map("map", { attributionControl: false, zoomControl: true });
-    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { subdomains: "abcd", maxZoom: 12 }).addTo(map);
+    map = L.map("map", { zoomControl: true });
+    addBaseTiles(map);
   }
   map.setView([geo.lat, geo.lon], 6);
   if (mapMarker) map.removeLayer(mapMarker);
@@ -1399,8 +1942,8 @@ async function plotGlobalMap() {
     const data = await r.json();
     const points = data.points || [];
     if (!gmapInstance) {
-      gmapInstance = L.map("gmap", { attributionControl: false, zoomControl: true, worldCopyJump: true }).setView([20, 0], 2);
-      L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { subdomains: "abcd", maxZoom: 12 }).addTo(gmapInstance);
+      gmapInstance = L.map("gmap", { zoomControl: true, worldCopyJump: true }).setView([20, 0], 2);
+      addBaseTiles(gmapInstance);
     }
     gmapDots.forEach(m => gmapInstance.removeLayer(m));
     gmapDots = points.map(pt => {

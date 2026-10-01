@@ -145,6 +145,25 @@ class _Api:
     app.js) hand external links off to the system's actual browser, since
     the embedded webview has no "new tab" to open them in."""
 
+    def __init__(self):
+        self._window = None
+        self._allow_close = False
+
+    def save_dialog(self, filename: str):
+        """Native Save As dialog. Returns the chosen path, or None."""
+        import webview
+        result = self._window.create_file_dialog(
+            webview.FileDialog.SAVE, save_filename=filename,
+            file_types=("Packet capture (*.pcap)", "All files (*.*)"))
+        if not result:
+            return None
+        return result if isinstance(result, str) else result[0]
+
+    def close_app(self):
+        """Called by the page once the user has saved or discarded."""
+        self._allow_close = True
+        self._window.destroy()
+
     def open_external(self, url: str):
         if not (url.startswith("http://") or url.startswith("https://")):
             return  # only ever open real web URLs, never a local file:// etc.
@@ -186,11 +205,34 @@ def main():
         if server_holder:
             server_holder[0].should_exit = True
 
+    # Off by default in pywebview, which silently broke every download
+    # button (reports, key log) in the desktop app.
+    webview.settings["ALLOW_DOWNLOADS"] = True
+
+    api = _Api()
+
+    def _on_closing():
+        # Like Wireshark: never close with unsaved packets without asking.
+        if api._allow_close:
+            return True
+        try:
+            import main as backend
+            unsaved = backend.engine.unsaved
+        except Exception:
+            unsaved = False
+        if not unsaved:
+            return True
+        threading.Thread(target=lambda: api._window.evaluate_js("ncAskBeforeClose()"),
+                         daemon=True).start()
+        return False
+
     try:
         window = webview.create_window(
             "Network Companion", url=f"http://{host}:{port}",
-            width=1440, height=900, resizable=True, js_api=_Api(),
+            width=1440, height=900, resizable=True, maximized=True, js_api=api,
         )
+        api._window = window
+        window.events.closing += _on_closing
         window.events.closed += _on_closed
         # NC_DEBUG=1 opens the inspector (right-click -> Inspect Element)
         # for troubleshooting; off by default since most people never need it.
@@ -210,6 +252,12 @@ def main():
 
 
 if __name__ == "__main__":
+    # Packet capture runs in a child process (see rawcapture.py). In the
+    # packaged .exe that child is this same executable relaunched, and this
+    # call is what turns it into the capture process instead of a second
+    # copy of the app.
+    import multiprocessing
+    multiprocessing.freeze_support()
     try:
         main()
     except SystemExit:

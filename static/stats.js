@@ -272,10 +272,19 @@ function renderStats() {
 $("#stats-refresh").addEventListener("click", renderStats);
 const statsIncludeNc = $("#stats-include-nc");
 if (statsIncludeNc) statsIncludeNc.addEventListener("change", renderStats);
+/* Auto-refresh recomputes over every packet, so on a big capture a fixed
+   2s timer would spend most of its time inside renderStats. Space refreshes
+   out to ~10x however long the last one took, never more often than 2s. */
+let statsNextAuto = 0;
 setInterval(() => {
   if (!$("#panel-stats").classList.contains("active")) return;
-  if (state.running && $("#stats-auto").checked) renderStats();
-}, 2000);
+  if (!state.running || !$("#stats-auto").checked) return;
+  const now = performance.now();
+  if (now < statsNextAuto) return;
+  renderStats();
+  const took = performance.now() - now;
+  statsNextAuto = performance.now() + Math.max(2000, took * 10);
+}, 500);
 
 /* ---------- capture-statistics report ---------- */
 function statsSourceLabel() {

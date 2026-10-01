@@ -1,16 +1,17 @@
 """
 Capture engine.
 
-Wraps Scapy's AsyncSniffer so packets can be streamed to the web UI over a
-WebSocket in real time, while the raw Scapy packet objects are retained in
-memory so full detail views and PCAP export stay accurate.
+Reads frames off the capture driver (see rawcapture.py), streams a summary
+of each to the web UI over a WebSocket in real time, and keeps every raw
+frame in memory so full detail views and PCAP export stay accurate.
 """
 
 import time
 import threading
+from collections import deque
 from typing import Optional, List, Callable
 
-from scapy.all import AsyncSniffer, get_working_ifaces, wrpcap, conf
+from scapy.all import PcapWriter, get_working_ifaces, conf
 from scapy.layers.l2 import Ether, ARP
 from scapy.layers.inet import IP, TCP, UDP, ICMP
 from scapy.layers.inet6 import IPv6
@@ -24,6 +25,7 @@ except Exception:  # pragma: no cover - DNS layer should always be present
 import threat as threat_mod
 import procmap
 import selftraffic
+import rawcapture
 
 
 # TCP flag bit -> readable name, in the order Wireshark shows them.
@@ -259,7 +261,20 @@ def classify_self_traffic(pkt, service_port):
     return None
 
 
-def _info_string(pkt, proto) -> str:
+def _wire_len(pkt) -> int:
+    """Packet length without re-serialising it. len(pkt) on a Scapy packet
+    rebuilds its bytes, which is a real cost on every captured packet; a
+    dissected packet still holds the original bytes it was built from."""
+    original = getattr(pkt, "original", None)
+    if original:
+        return len(original)
+    return len(pkt)
+
+
+_NO_HINT = object()
+
+
+def _info_string(pkt, proto, hint=_NO_HINT) -> str:
     """A compact human-readable summary, similar to Wireshark's Info column."""
     if DNS is not None and pkt.haslayer(DNS):
         dns = pkt[DNS]
@@ -274,7 +289,8 @@ def _info_string(pkt, proto) -> str:
         tcp = pkt[TCP]
         flags = ",".join(_tcp_flag_list(tcp.flags)) or "none"
         base = f"{tcp.sport} \u2192 {tcp.dport} [{flags}] seq={tcp.seq} win={tcp.window}"
-        hint = _payload_hint(pkt)
+        if hint is _NO_HINT:
+            hint = _payload_hint(pkt)
         if hint:
             label, host, request_line = hint
             if request_line:
@@ -311,7 +327,8 @@ def summarize(pkt, number: int, base_time: float) -> dict:
     elif pkt.haslayer(ARP):
         transport = "arp"
     domain = None
-    if pkt.haslayer(TCP):
+    hint = None
+    if transport == "tcp":
         hint = _payload_hint(pkt)
         if hint:
             domain = hint[1]
@@ -330,8 +347,8 @@ def summarize(pkt, number: int, base_time: float) -> dict:
         "dst": dst,
         "proto": proto,
         "transport": transport,
-        "length": len(pkt),
-        "info": _info_string(pkt, proto),
+        "length": _wire_len(pkt),
+        "info": _info_string(pkt, proto, hint),
         "domain": domain,
         "sport": None,
         "dport": None,
@@ -407,39 +424,111 @@ def detail(pkt) -> dict:
     }
 
 
+class _Frame:
+    """A captured frame kept as raw bytes rather than a dissected Scapy
+    packet. A dissected packet costs several KB of Python objects; the raw
+    bytes cost roughly their own size, so long captures don't run the
+    machine out of memory. Dissected again on demand (detail view, replay,
+    export), which is quick for a single packet."""
+
+    __slots__ = ("time", "data", "wirelen", "ll")
+
+    def __init__(self, ts, data, wirelen, ll):
+        self.time = ts
+        self.data = data
+        self.wirelen = wirelen
+        self.ll = ll
+
+
+def _dissect(ll, data: bytes, ts: float, wirelen: int):
+    try:
+        pkt = ll(data)
+    except Exception:
+        pkt = conf.raw_layer(data)
+    pkt.time = ts
+    pkt.wirelen = wirelen
+    return pkt
+
+
+def _materialize(item):
+    """A Scapy packet for a stored item (a _Frame, or a packet that came
+    from a loaded PCAP and is already dissected)."""
+    if isinstance(item, _Frame):
+        return _dissect(item.ll, item.data, item.time, item.wirelen)
+    return item
+
+
+def _fallback_row(item, number: int, base: float) -> dict:
+    """Bare-bones row for a packet the summary code couldn't handle, so it
+    still shows up in the table instead of silently going missing."""
+    ts = float(getattr(item, "time", 0) or 0)
+    data = getattr(item, "data", None)
+    return {
+        "number": number, "time": round(ts - base, 6), "epoch": ts,
+        "src": "", "dst": "", "proto": "Unknown", "transport": None,
+        "length": len(data) if data is not None else 0,
+        "info": "(could not decode)", "domain": None,
+        "sport": None, "dport": None, "flags": [],
+    }
+
+
 class CaptureEngine:
-    """Owns the live sniffer and the buffer of captured packets. Unbounded by
+    """Owns the live capture and the buffer of captured packets. Unbounded by
     design: nothing is ever dropped from a running capture, no matter how
-    long it runs or how large it gets. Appending to the end of a Python list
-    is O(1), so this doesn't cost anything per packet; it only costs memory,
-    which is the analyst's call to manage (stop and export, or clear)."""
+    long it runs or how large it gets.
+
+    Two threads per capture: a reader (rawcapture.py) that only copies frames
+    off the driver into self._raw, and a worker that dissects, classifies and
+    stores them. If the worker falls behind, frames wait in self._raw rather
+    than overflowing the driver, and `backlog` says how far behind it is.
+    Stopping a capture stops the reader immediately but lets the worker
+    finish everything already read, so nothing captured is thrown away."""
 
     def __init__(self, on_packet: Optional[Callable[[dict], None]] = None,
                  on_nc_packet: Optional[Callable[[dict], None]] = None,
                  service_port: Optional[int] = None):
-        self._sniffer: Optional[AsyncSniffer] = None
-        self._packets = []           # raw Scapy packets, index == packet number
+        self._reader = None
+        self._worker: Optional[threading.Thread] = None
+        self._raw: deque = deque()
+        self._packets = []           # _Frame or Scapy packet, index == packet number
         self._lock = threading.Lock()
         self._base_time: Optional[float] = None
-        self._on_packet = on_packet  # called from the sniffer thread per packet
+        self._on_packet = on_packet  # called from the worker thread per packet
         self._scan = threat_mod.ScanTracker()
         self.iface = None
         self.bpf = None
+        # Bumped whenever packet numbering restarts (clear / new capture /
+        # PCAP load) so the UI can ignore rows from a previous session.
+        self.session = 0
+        # Frames timestamped before this are skipped by the worker: they were
+        # captured before the user hit Clear but hadn't been decoded yet.
+        self._discard_before = 0.0
+        # Whether the current capture has packets that haven't been exported.
+        # The capture file is never deleted while this is set.
+        self.unsaved = False
+        self._file_path: Optional[str] = None
+        # Unsaved capture files found at startup and moved to Documents.
+        self.recovered = rawcapture.rescue_leftovers()
 
         # "NC Traffic" side buffer: packets Network Companion generated about
         # itself (see classify_self_traffic). Kept entirely separate from
         # self._packets so PCAP export never includes them.
         self._on_nc_packet = on_nc_packet
         self._service_port = service_port
-        self._nc_packets: dict = {}   # id -> raw Scapy packet
+        self._nc_packets: dict = {}   # id -> _Frame
         self._nc_next_id = 0
         self._nc_base_time: Optional[float] = None
 
     @property
     def running(self) -> bool:
-        return self._sniffer is not None and self._sniffer.running
+        return self._reader is not None and self._reader.capturing
 
-    def list_interfaces(self):
+    def list_interfaces(self, refresh: bool = False):
+        if refresh:
+            try:
+                conf.ifaces.reload()
+            except Exception:
+                pass
         result = []
         try:
             for iface in get_working_ifaces():
@@ -456,7 +545,28 @@ class CaptureEngine:
                 result.append({"name": name, "description": name, "mac": "", "ip": ""})
         return result
 
-    def _handle(self, pkt):
+    def _work(self, raw: deque, reader):
+        """Worker thread: drain frames until the reader has stopped and the
+        backlog is empty."""
+        while True:
+            try:
+                ts, data, wirelen, ll = raw.popleft()
+                if ts < self._discard_before:
+                    continue
+            except IndexError:
+                if not reader.alive:
+                    if not raw:
+                        return
+                    continue
+                time.sleep(0.002)
+                continue
+            try:
+                self._ingest(_Frame(ts, data, wirelen, ll))
+            except Exception:
+                pass
+
+    def _ingest(self, frame: _Frame):
+        pkt = _dissect(frame.ll, frame.data, frame.time, frame.wirelen)
         try:
             reason = classify_self_traffic(pkt, self._service_port)
         except Exception:
@@ -465,12 +575,15 @@ class CaptureEngine:
         if reason is not None:
             with self._lock:
                 if self._nc_base_time is None:
-                    self._nc_base_time = float(getattr(pkt, "time", time.time()))
+                    self._nc_base_time = frame.time
                 nc_id = self._nc_next_id
                 self._nc_next_id += 1
-                self._nc_packets[nc_id] = pkt
+                self._nc_packets[nc_id] = frame
                 base = self._nc_base_time
-            row = summarize(pkt, nc_id, base)
+            try:
+                row = summarize(pkt, nc_id, base)
+            except Exception:
+                row = _fallback_row(frame, nc_id, base)
             row["reason"] = reason
             if self._on_nc_packet is not None:
                 try:
@@ -479,17 +592,25 @@ class CaptureEngine:
                     pass
             return
 
+        # Store first, so a packet that trips up the summary code is still
+        # in the capture and the export.
         with self._lock:
             if self._base_time is None:
-                self._base_time = float(getattr(pkt, "time", time.time()))
+                self._base_time = frame.time
             number = len(self._packets)
-            self._packets.append(pkt)
+            self._packets.append(frame)
+            self.unsaved = True
             base = self._base_time
-        row = summarize(pkt, number, base)
+            session = self.session
+        try:
+            row = summarize(pkt, number, base)
+        except Exception:
+            row = _fallback_row(frame, number, base)
         try:
             row["threat"] = threat_mod.assess(pkt, self._scan)
         except Exception:
             row["threat"] = {"level": "none", "reasons": []}
+        row["session"] = session
         if self._on_packet is not None:
             try:
                 self._on_packet(row)
@@ -497,50 +618,151 @@ class CaptureEngine:
                 pass
 
     def start(self, iface: Optional[str] = None, bpf: Optional[str] = None,
-              promisc: bool = True):
+              promisc: bool = True, buffer_mb: Optional[int] = None):
         if self.running:
             raise RuntimeError("A capture is already running.")
+        # Starting over: stop decoding whatever's left of the previous
+        # capture (it's all in that capture's file regardless).
+        if self._reader is not None:
+            self._reader.abandon()
+        self._raw.clear()
+        self._finish_worker()
+        self._retire_file()
         self.iface = iface or None
         self.bpf = (bpf or "").strip() or None
         conf.sniff_promisc = 1 if promisc else 0
-        kwargs = {"prn": self._handle, "store": False}
-        if self.iface:
-            kwargs["iface"] = self.iface
-        if self.bpf:
-            kwargs["filter"] = self.bpf
-        self._sniffer = AsyncSniffer(**kwargs)
-        self._sniffer.start()
+        mb = buffer_mb if buffer_mb in rawcapture.DRIVER_BUFFER_CHOICES_MB else None
+        buffer_bytes = mb * 1024 * 1024 if mb else rawcapture.DRIVER_BUFFER_BYTES
+        raw: deque = deque()
+        path = rawcapture.new_capture_path()
+        reader = rawcapture.open_reader(raw, self.iface, self.bpf, promisc, path, buffer_bytes)
+        self._file_path = path if getattr(reader, "spool", None) is not None else None
+        self.buffer_mb = buffer_bytes // (1024 * 1024)
+        self._raw = raw
+        self._reader = reader
+        self._worker = threading.Thread(target=self._work, args=(raw, reader),
+                                        name="nc-worker", daemon=True)
+        reader.start()
+        self._worker.start()
 
     def stop(self):
-        if self._sniffer is not None:
+        reader = self._reader
+        if reader is not None:
             try:
-                self._sniffer.stop()
+                reader.stop()
             except Exception:
                 pass
-        self._sniffer = None
+        # The reader object is kept for its final counters, and the worker
+        # keeps going until it has processed everything already captured.
+
+    def _retire_file(self):
+        """Done with the previous capture's file: delete it if everything in
+        it was saved (or the user chose to discard it), otherwise move it to
+        Documents. Never just deletes unsaved packets."""
+        path, self._file_path = self._file_path, None
+        if not path:
+            return
+        if self.unsaved:
+            dest = rawcapture.keep_file(path)
+            if dest:
+                self.recovered.append(dest)
+        else:
+            rawcapture.delete_file(path)
+
+    def discard(self):
+        """The user chose not to save the current capture. If it's no longer
+        running, its file can go right away."""
+        self.unsaved = False
+        if not self.running and not (self._worker is not None and self._worker.is_alive()):
+            self._retire_file()
+
+    def shutdown(self):
+        """App is closing: stop capturing; the capture file is deleted only
+        if it was saved or discarded, otherwise moved to Documents."""
+        self.stop()
+        if self._reader is not None:
+            try:
+                self._reader.abandon()
+            except Exception:
+                pass
+        self._retire_file()
+
+    def _finish_worker(self):
+        if self._worker is not None:
+            self._worker.join()
+            self._worker = None
+
+    def capture_status(self) -> dict:
+        """Driver drop counters plus how far the worker is behind."""
+        reader = self._reader
+        stats = reader.stats if reader is not None else None
+        error = reader.error if reader is not None else None
+        spool = reader.spool if reader is not None else None
+        on_disk = reader.on_disk if reader is not None else 0
+        return {
+            "driver": stats,
+            "backlog": len(self._raw) + on_disk,
+            "buffer_mb": getattr(self, "buffer_mb", None),
+            "unsaved": self.unsaved,
+            "recovered": self.recovered,
+            "processing": self._worker is not None and self._worker.is_alive(),
+            "error": error,
+            "file": None if spool is None else {
+                "path": spool.path, "bytes": spool.bytes, "error": spool.error,
+            },
+        }
 
     def clear(self):
         with self._lock:
+            self._raw.clear()  # frames read before the clear belong to the old capture
+            self._discard_before = time.time()
             self._packets = []
             self._base_time = None
+            self.session += 1
 
     def count(self) -> int:
         with self._lock:
             return len(self._packets)
 
+    def rows(self, start: int, end: int):
+        """Summaries for packets [start, end), so the UI can fill in anything
+        it missed (e.g. after a dropped WebSocket). Scan detection isn't
+        re-run for these; the other threat checks are."""
+        start = max(0, start)
+        with self._lock:
+            items = self._packets[start:max(start, end)]
+            base = self._base_time or 0.0
+            session = self.session
+        out = []
+        for i, item in enumerate(items, start=start):
+            pkt = _materialize(item)
+            try:
+                row = summarize(pkt, i, base)
+            except Exception:
+                row = _fallback_row(item, i, base)
+            try:
+                row["threat"] = threat_mod.assess(pkt)
+            except Exception:
+                row["threat"] = {"level": "none", "reasons": []}
+            row["session"] = session
+            row["channel"] = "capture"
+            out.append(row)
+        return session, out
+
     def get_detail(self, index: int) -> Optional[dict]:
         with self._lock:
             if index < 0 or index >= len(self._packets):
                 return None
-            pkt = self._packets[index]
-        return detail(pkt)
+            item = self._packets[index]
+        return detail(_materialize(item))
 
     def get_packet(self, index: int):
-        """Return the raw Scapy packet at an index (for replay), or None."""
+        """Return the Scapy packet at an index (for replay), or None."""
         with self._lock:
             if index < 0 or index >= len(self._packets):
                 return None
-            return self._packets[index]
+            item = self._packets[index]
+        return _materialize(item)
 
     def nc_count(self) -> int:
         with self._lock:
@@ -558,21 +780,35 @@ class CaptureEngine:
 
     def get_nc_detail(self, nc_id: int) -> Optional[dict]:
         with self._lock:
-            pkt = self._nc_packets.get(nc_id)
-        if pkt is None:
+            item = self._nc_packets.get(nc_id)
+        if item is None:
             return None
-        return detail(pkt)
+        return detail(_materialize(item))
 
     def get_nc_packet(self, nc_id: int):
-        """Return the raw Scapy packet for an NC Traffic entry (for replay)."""
+        """Return the Scapy packet for an NC Traffic entry (for replay)."""
         with self._lock:
-            return self._nc_packets.get(nc_id)
+            item = self._nc_packets.get(nc_id)
+        return None if item is None else _materialize(item)
+
+    @staticmethod
+    def _write_pcap(path: str, items) -> int:
+        # Stream to disk one packet at a time rather than building a list of
+        # dissected packets, which for a big capture could need gigabytes.
+        with PcapWriter(path, sync=False) as writer:
+            for item in items:
+                writer.write(_materialize(item))
+        return len(items)
 
     def export_pcap(self, path: str) -> int:
         with self._lock:
-            pkts = list(self._packets)
-        wrpcap(path, pkts)
-        return len(pkts)
+            items = list(self._packets)
+        n = self._write_pcap(path, items)
+        with self._lock:
+            # Saved, unless more packets arrived while writing.
+            if len(self._packets) == len(items):
+                self.unsaved = False
+        return n
 
     def export_pcap_all(self, path: str) -> int:
         """Export the main capture plus everything diverted into NC Traffic,
@@ -580,18 +816,25 @@ class CaptureEngine:
         this explicitly (a different button from the default export), since
         normally NC Traffic is kept out of saved captures on purpose."""
         with self._lock:
-            pkts = list(self._packets) + list(self._nc_packets.values())
-        pkts.sort(key=lambda p: float(getattr(p, "time", 0)))
-        wrpcap(path, pkts)
-        return len(pkts)
+            items = list(self._packets) + list(self._nc_packets.values())
+        items.sort(key=lambda p: float(getattr(p, "time", 0)))
+        n = self._write_pcap(path, items)
+        with self._lock:
+            if len(self._packets) + len(self._nc_packets) == len(items):
+                self.unsaved = False
+        return n
 
     def load(self, pkts) -> list:
         """Replace the buffer with packets from a loaded PCAP; return summaries."""
         pkts = list(pkts)
         with self._lock:
+            self._raw.clear()
+            self.unsaved = False  # it came from a file, so it's already saved
             self._packets = pkts
             self._base_time = float(getattr(pkts[0], "time", time.time())) if pkts else None
             base = self._base_time or time.time()
+            self.session += 1
+            session = self.session
         tracker = threat_mod.ScanTracker()
         rows = []
         for i, p in enumerate(pkts):
@@ -600,5 +843,6 @@ class CaptureEngine:
                 row["threat"] = threat_mod.assess(p, tracker)
             except Exception:
                 row["threat"] = {"level": "none", "reasons": []}
+            row["session"] = session
             rows.append(row)
         return rows
